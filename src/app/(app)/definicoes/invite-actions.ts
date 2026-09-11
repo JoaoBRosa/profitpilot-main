@@ -1,0 +1,154 @@
+"use server";
+
+import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
+import { z } from "zod";
+import { getCurrentUser, switchWorkspace } from "@/lib/auth";
+import {
+  createWorkspaceInvitation,
+  acceptInvitation,
+  declineInvitation,
+  revokeInvitation,
+  resolveInviteIdentifier,
+} from "@/lib/invitations";
+import {
+  TEAM_INVITES_DISABLED_MESSAGE,
+  TEAM_INVITES_ENABLED,
+} from "@/lib/feature-flags";
+import { canInviteMembers } from "@/lib/rbac";
+import { parseStoreIdsFromForm } from "@/lib/store-access";
+import { validateInviteIdentifier } from "@/lib/username";
+import { isWorkspaceOwner } from "@/lib/workspace-ownership";
+
+export type InviteActionState = { ok?: boolean; error?: string };
+
+function teamInvitesBlocked(): InviteActionState | null {
+  if (!TEAM_INVITES_ENABLED) {
+    return { error: TEAM_INVITES_DISABLED_MESSAGE };
+  }
+  return null;
+}
+
+const inviteSchema = z.object({
+  role: z.enum(["admin", "editor", "viewer"]),
+  storeScope: z.enum(["all", "selected"]),
+});
+
+export async function inviteMemberAction(
+  _prev: InviteActionState,
+  formData: FormData,
+): Promise<InviteActionState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const blocked = teamInvitesBlocked();
+  if (blocked) return blocked;
+  const ownsWorkspace = await isWorkspaceOwner(user.id, user.workspaceId);
+  if (!canInviteMembers(user.role, ownsWorkspace)) {
+    return { error: "Só o proprietário pode convidar membros." };
+  }
+
+  const identifier = String(formData.get("identifier") ?? "").trim();
+  const idError = validateInviteIdentifier(identifier);
+  if (idError) return { error: idError };
+
+  const parsed = inviteSchema.safeParse({
+    role: formData.get("role"),
+    storeScope: formData.get("storeScope"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Dados inválidos." };
+  }
+
+  const resolved = await resolveInviteIdentifier(identifier);
+  if (!resolved.ok) return { error: resolved.error };
+
+  const storeIds = parseStoreIdsFromForm(formData.get("storeIds"));
+  const storeAccess =
+    parsed.data.storeScope === "all" ? ("all" as const) : storeIds;
+
+  const result = await createWorkspaceInvitation({
+    workspaceId: user.workspaceId,
+    invitedByUserId: user.id,
+    actorRole: user.role,
+    target: resolved.target,
+    role: parsed.data.role,
+    storeAccess,
+  });
+
+  if (!result.ok) return { error: result.error };
+
+  revalidatePath("/definicoes");
+  revalidatePath("/", "layout");
+  return { ok: true };
+}
+
+export async function acceptInvitationAction(
+  _prev: InviteActionState,
+  formData: FormData,
+): Promise<InviteActionState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const blocked = teamInvitesBlocked();
+  if (blocked) return blocked;
+
+  const invitationId = String(formData.get("invitationId") ?? "").trim();
+  if (!invitationId) return { error: "Convite inválido." };
+
+  const result = await acceptInvitation(invitationId, {
+    id: user.id,
+    email: user.email,
+    username: user.username,
+  });
+  if (!result.ok) return { error: result.error };
+
+  await switchWorkspace(result.workspaceId);
+  revalidatePath("/definicoes");
+  revalidatePath("/", "layout");
+  return { ok: true };
+}
+
+export async function declineInvitationAction(
+  _prev: InviteActionState,
+  formData: FormData,
+): Promise<InviteActionState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const blocked = teamInvitesBlocked();
+  if (blocked) return blocked;
+
+  const invitationId = String(formData.get("invitationId") ?? "").trim();
+  if (!invitationId) return { error: "Convite inválido." };
+
+  const result = await declineInvitation(invitationId, {
+    id: user.id,
+    email: user.email,
+    username: user.username,
+  });
+  if (!result.ok) return { error: result.error };
+
+  revalidatePath("/definicoes");
+  return { ok: true };
+}
+
+export async function revokeInvitationAction(
+  _prev: InviteActionState,
+  formData: FormData,
+): Promise<InviteActionState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const blocked = teamInvitesBlocked();
+  if (blocked) return blocked;
+  const ownsWorkspace = await isWorkspaceOwner(user.id, user.workspaceId);
+  if (!canInviteMembers(user.role, ownsWorkspace)) {
+    return { error: "Só o proprietário pode revogar convites." };
+  }
+
+  const invitationId = String(formData.get("invitationId") ?? "").trim();
+  if (!invitationId) return { error: "Convite inválido." };
+
+  const result = await revokeInvitation(invitationId, user.workspaceId);
+  if (!result.ok) return { error: result.error };
+
+  revalidatePath("/definicoes");
+  return { ok: true };
+}

@@ -1,0 +1,31 @@
+import type { Metadata } from "next";
+import { Suspense } from "react";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+import { getCurrentUser } from "@/lib/auth";
+import { LoginForm } from "../login-form";
+
+export const metadata: Metadata = { title: "Entrar" };
+
+export default async function LoginPage() {
+  const user = await getCurrentUser();
+  if (user) redirect("/dashboard");
+
+  return (
+    <div>
+      <h1 className="text-xl font-semibold">Entrar</h1>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Acede à tua conta.
+      </p>
+      <Suspense fallback={null}>
+        <LoginForm />
+      </Suspense>
+      <p className="mt-4 text-center text-sm text-muted-foreground">
+        Não tens conta?{" "}
+        <Link href="/registo" className="font-medium text-accent">
+          Criar conta
+        </Link>
+      </p>
+    </div>
+  );
+}

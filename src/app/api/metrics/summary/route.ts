@@ -1,0 +1,41 @@
+import { NextResponse } from "next/server";
+import { getCachedWorkspaceSummary } from "@/lib/metrics-summary-cache";
+import { parseFreshParam } from "@/lib/request-fresh";
+import {
+  authErrorResponse,
+  requireUser,
+  requireWorkspaceStore,
+} from "@/lib/require-auth";
+
+export const dynamic = "force-dynamic";
+
+/** Summary da dashboard — só lê BD; sync ads é via cron ou botão manual. */
+export async function GET(request: Request) {
+  try {
+    const user = await requireUser();
+    const params = new URL(request.url).searchParams;
+    const storeId = params.get("store") ?? undefined;
+    if (storeId) {
+      await requireWorkspaceStore(user, storeId, { activeOnly: true });
+    }
+
+    const summary = await getCachedWorkspaceSummary(
+      user.workspaceId,
+      storeId,
+      {
+        period: params.get("period"),
+        from: params.get("from"),
+        to: params.get("to"),
+        dates: params.get("dates"),
+      },
+      user.storeAccess,
+      { fresh: parseFreshParam(params) },
+    );
+
+    return NextResponse.json(summary, {
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch (e) {
+    return authErrorResponse(e);
+  }
+}

@@ -1,0 +1,374 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { Wallet, Settings, AlertTriangle } from "lucide-react";
+import { Sensitive } from "@/components/privacy-mode";
+import { ScopeLink } from "@/components/scope-link";
+import type { WorkspaceTreasury } from "@/lib/treasury";
+import {
+  incomingDayLineReactKey,
+  mergeIncomingDayLines,
+  type IncomingDayLine,
+} from "@/lib/treasury-day-lines";
+import { useWorkspace } from "@/components/workspace-context";
+import { KpiCard } from "@/components/ui/kpi-card";
+import { LastSyncBadge } from "@/components/last-sync-badge";
+import { withLiveFreshParam } from "@/lib/refresh-live-queries";
+import { cn } from "@/lib/utils";
+
+async function fetchTreasury(storeId: string | null): Promise<WorkspaceTreasury> {
+  const url = storeId
+    ? `/api/metrics/treasury?store=${encodeURIComponent(storeId)}`
+    : "/api/metrics/treasury";
+  const res = await fetch(withLiveFreshParam(url), { cache: "no-store" });
+  if (!res.ok) throw new Error("Falha ao carregar tesouraria.");
+  return res.json();
+}
+
+function IncomingTimeline({
+  lines,
+  emptyLabel,
+  currency = "EUR",
+}: {
+  lines: IncomingDayLine[];
+  emptyLabel: string;
+  currency?: string;
+}) {
+  const merged = useMemo(
+    () => mergeIncomingDayLines(lines, currency),
+    [lines, currency],
+  );
+
+  if (merged.length === 0) {
+    return (
+      <p className="px-5 py-8 text-center text-sm text-muted-foreground">
+        {emptyLabel}
+      </p>
+    );
+  }
+
+  return (
+    <ul className="divide-y divide-border">
+      {merged.map((line) => (
+        <li
+          key={incomingDayLineReactKey(line)}
+          className="flex items-center justify-between gap-4 px-5 py-3"
+        >
+          <div className="min-w-0">
+            <p className="font-medium tabular-nums">{line.dateLabel}</p>
+            <p className="text-xs text-muted-foreground">{line.kindLabel}</p>
+            {line.detailLabel ? (
+              <p className="text-[11px] text-muted-foreground">{line.detailLabel}</p>
+            ) : null}
+          </div>
+          <span className="shrink-0 tabular-nums font-medium" data-sensitive>
+            {line.amountFmt}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function TreasuryClient() {
+  const { workspaceId } = useWorkspace();
+  const storeId = useSearchParams().get("store");
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  const { data, isError, isFetching, isPending } = useQuery({
+    queryKey: ["treasury", workspaceId, storeId],
+    queryFn: () => fetchTreasury(storeId),
+    placeholderData: (prev) => prev,
+    refetchInterval: 60 * 1000,
+  });
+
+  const scopeStore = storeId
+    ? data?.stores.find((s) => s.storeId === storeId)
+    : null;
+
+  const lastSyncedAt = data?.lastSyncedAt ?? null;
+
+  const payoutErrors = data?.stores.filter((s) => s.payoutsError) ?? [];
+
+  const view = scopeStore ?? data?.totals;
+
+  const kpis = view
+    ? scopeStore
+      ? [
+          {
+            label: "Saldo em conta",
+            value: scopeStore.cashOnHandFmt,
+            title: scopeStore.cashOnHandTitle,
+          },
+          {
+            label: scopeStore.externalGatewayPayoutBusinessDays
+              ? "A receber"
+              : "A receber (Shopify)",
+            value: scopeStore.shopifyPendingFmt,
+            title: scopeStore.shopifyPendingTitle,
+          },
+          {
+            label: "Recebido",
+            value: scopeStore.receivedFmt,
+            title: scopeStore.receivedFmt,
+          },
+          {
+            label: "Saídas (COGS+ads)",
+            value: scopeStore.outflowsTotalFmt,
+            title: scopeStore.outflowsTotalFmt,
+          },
+        ]
+      : [
+          {
+            label: "Saldo em conta",
+            value: data!.totals.cashOnHandFmt,
+            title: data!.totals.cashOnHandTitle,
+          },
+          {
+            label: "A receber (Shopify)",
+            value: data!.totals.shopifyPendingFmt,
+            title: data!.totals.shopifyPendingFmt,
+          },
+          {
+            label: "Recebido",
+            value: data!.totals.receivedFmt,
+            title: data!.totals.receivedFmt,
+          },
+          {
+            label: "Saídas",
+            value: data!.totals.outflowsTotalFmt,
+            title: data!.totals.outflowsTotalFmt,
+          },
+        ]
+    : [];
+
+  const currency = data?.currency ?? "EUR";
+
+  const incomingLines = scopeStore
+    ? scopeStore.incomingByDay
+    : (data?.incomingByDay ?? []);
+
+  const receivedLines = scopeStore
+    ? scopeStore.receivedByDay
+    : (data?.receivedByDay ?? []);
+
+  return (
+    <div
+      className={cn(
+        "mx-auto max-w-5xl space-y-6",
+        Boolean(data) && isFetching && "opacity-[0.92] transition-opacity duration-150",
+      )}
+    >
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {scopeStore ? (
+              <Sensitive as="span">{scopeStore.storeName}</Sensitive>
+            ) : (
+              "Tesouraria"
+            )}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Caixa real — o que tens, o que vem e o que já recebeste.
+            {scopeStore?.startingBalanceDate && (
+              <>
+                {" "}
+                Saldo inicial desde{" "}
+                {new Date(scopeStore.startingBalanceDate).toLocaleDateString(
+                  "pt-PT",
+                )}
+                .
+              </>
+            )}
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <LastSyncBadge lastSyncedAt={lastSyncedAt} fetching={isFetching} />
+          <ScopeLink
+            href="/definicoes#capital-negocio"
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted"
+          >
+            <Wallet className="h-4 w-4" />
+            Capital no negócio
+          </ScopeLink>
+          <ScopeLink
+            href="/definicoes"
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted"
+          >
+            <Settings className="h-4 w-4" />
+            Saldo inicial
+          </ScopeLink>
+        </div>
+      </div>
+
+      {isError && (
+        <p className="rounded-lg border border-negative/30 bg-negative/10 px-3 py-2 text-sm text-negative">
+          Não foi possível carregar a tesouraria. A tentar novamente…
+        </p>
+      )}
+
+      {payoutErrors.length > 0 && (
+        <div className="rounded-lg border border-warning/40 bg-warning/10 p-4">
+          <p className="flex items-center gap-2 text-sm font-medium text-warning">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            Dados Shopify incompletos — sincroniza a loja
+          </p>
+          <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+            {payoutErrors.map((s) => (
+              <li key={s.storeId}>
+                <Sensitive as="span" className="font-medium text-foreground">
+                  {s.storeName}
+                </Sensitive>
+                : {s.payoutsError}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {!mounted || (!data && (isPending || isFetching)) ? (
+        <div className="animate-pulse space-y-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div
+                key={i}
+                className="h-[88px] rounded-lg border border-border bg-muted/80"
+              />
+            ))}
+          </div>
+          <div className="h-40 rounded-lg border border-border bg-muted/60" />
+        </div>
+      ) : !data || data.stores.length === 0 ? (
+        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface p-12 text-center">
+          <Wallet className="h-8 w-8 text-muted-foreground" />
+          <p className="mt-3 text-sm font-medium">Sem lojas ligadas.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Adiciona uma loja e sincroniza para ver a tesouraria.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            {kpis.length > 0
+              ? kpis.map((k) => (
+                  <KpiCard
+                    key={k.label}
+                    label={k.label}
+                    value={k.value}
+                    title={k.title}
+                  />
+                ))
+              : Array.from({ length: 4 }).map((_, i) => (
+                  <div
+                    key={i}
+                    className="h-[100px] animate-pulse rounded-lg border border-border bg-muted"
+                  />
+                ))}
+          </div>
+
+          <p className="text-xs text-muted-foreground">
+            Saldo em conta = saldo inicial + recebido − COGS − envio − ad spend
+            (desde o início da loja). Não inclui vendas Shopify ainda por pagar.
+            «A receber» = por pagar na Shopify + payouts agendados/a caminho.
+          </p>
+
+          <div className="rounded-lg border border-border bg-surface">
+            <div className="border-b border-border p-5">
+              <h2 className="text-lg font-semibold">Recebido, por dia</h2>
+              <p className="text-sm text-muted-foreground">
+                Payouts já na conta — atualiza após sincronizar a loja.
+              </p>
+            </div>
+            <IncomingTimeline
+              lines={receivedLines}
+              currency={currency}
+              emptyLabel="Ainda sem payouts recebidos neste período."
+            />
+          </div>
+
+          <div className="rounded-lg border border-border bg-surface">
+            <div className="border-b border-border p-5">
+              <h2 className="text-lg font-semibold">A caminho, por dia</h2>
+              <p className="text-sm text-muted-foreground">
+                <span className="font-medium text-foreground">Payout agendado</span>{" "}
+                = data prevista na conta.{" "}
+                <span className="font-medium text-foreground">
+                  Vendas por liquidar
+                </span>{" "}
+                = vendas desse dia ainda sem payout (inclui fim de semana — a
+                Shopify paga em dias úteis). Estas linhas são o detalhe do
+                saldo «por pagar», não somam por cima do total «A receber».
+              </p>
+            </div>
+            <IncomingTimeline
+              lines={incomingLines}
+              currency={currency}
+              emptyLabel="Nada a caminho. Sincroniza a loja para atualizar."
+            />
+          </div>
+
+          {!scopeStore && (
+            <div className="rounded-lg border border-border bg-surface">
+              <div className="border-b border-border p-5">
+                <h2 className="text-lg font-semibold">Por loja</h2>
+                <p className="text-sm text-muted-foreground">
+                  Resumo de caixa por loja.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[640px] text-sm">
+                  <thead>
+                    <tr className="text-left text-xs font-medium text-muted-foreground">
+                      <th className="px-5 py-3">Loja</th>
+                <th className="px-5 py-3 text-right">Por liquidar</th>
+                <th className="px-5 py-3 text-right">Agendado</th>
+                      <th className="px-5 py-3 text-right">Recebido</th>
+                      <th className="px-5 py-3 text-right">Saídas</th>
+                      <th className="px-5 py-3 text-right">Em conta</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.stores.map((s) => (
+                      <tr
+                        key={s.storeId}
+                        className="border-t border-border hover:bg-muted"
+                      >
+                        <td className="px-5 py-3 font-medium">
+                          <Sensitive>{s.storeName}</Sensitive>
+                        </td>
+                        <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                          {s.availableFmt}
+                        </td>
+                        <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                          {s.incomingFmt}
+                        </td>
+                        <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                          {s.receivedFmt}
+                        </td>
+                        <td className="px-5 py-3 text-right tabular-nums text-negative" data-sensitive>
+                          {s.outflowsTotalFmt}
+                        </td>
+                        <td
+                          className="px-5 py-3 text-right tabular-nums"
+                          title={s.cashOnHandTitle}
+                          data-sensitive
+                        >
+                          {s.cashOnHandFmt}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

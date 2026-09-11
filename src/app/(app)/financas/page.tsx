@@ -1,0 +1,477 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { Suspense } from "react";
+import { redirect } from "next/navigation";
+import { Megaphone, Boxes } from "lucide-react";
+import { ExportFormatLinks } from "@/components/export-format-links";
+import { ScopeLink } from "@/components/scope-link";
+import { getCurrentUser } from "@/lib/auth";
+import { canAccessStore } from "@/lib/store-access";
+import { buildWorkspacePnl } from "@/lib/metrics";
+import { buildWorkspaceTreasury } from "@/lib/treasury";
+import { scopeQueryFromInput } from "@/lib/scope-query";
+import { formatCurrency, formatPercent, cn } from "@/lib/utils";
+import { formatProfitBreakdown } from "@/lib/profit";
+import { DataWarnings } from "@/components/dashboard/data-warnings";
+import { FinancasView } from "@/components/financas/financas-view";
+import { StoreCashFlowSection } from "@/components/financas/store-cash-flow";
+import { ConsolidatedCashSection } from "@/components/financas/consolidated-cash-section";
+import { ExpensesPanel } from "@/components/financas/expenses-panel";
+import { BusinessPnlPanel } from "@/components/financas/business-pnl-panel";
+import { FinancasModeToggle } from "@/components/financas/financas-mode-toggle";
+import { connectToDatabase } from "@/lib/db";
+import { Store } from "@/models/Store";
+import { listWorkspaceExpenses, sumWorkspaceMonthlyFixedBase } from "@/lib/expenses";
+import { expenseAppliesInPeriod } from "@/lib/expense-proration";
+import { periodToDateKeys } from "@/lib/period-date-keys";
+import {
+  dominantStoreTimezone,
+  normalizeStoreTimezone,
+  resolvePeriodForStore,
+} from "@/lib/store-timezone";
+import { storeQueryForUser } from "@/lib/store-scope";
+
+export const metadata: Metadata = { title: "Lucro & Finanças" };
+export const dynamic = "force-dynamic";
+
+export default async function FinancasPage({
+  searchParams,
+}: {
+  searchParams: Promise<{
+    store?: string;
+    period?: string;
+    from?: string;
+    to?: string;
+    dates?: string;
+    mode?: string;
+  }>;
+}) {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const { store: storeId, period, from, to, dates, mode } = await searchParams;
+  const businessMode = mode === "business" && !storeId;
+  if (storeId && !canAccessStore(user.storeAccess, storeId)) {
+    redirect("/financas");
+  }
+  const pnl = await buildWorkspacePnl(
+    user.workspaceId,
+    { period, from, to, dates },
+    storeId,
+    user.storeAccess,
+  );
+  const treasury = await buildWorkspaceTreasury(
+    user.workspaceId,
+    storeId,
+    user.storeAccess,
+  );
+  const storeCash = storeId ? (treasury.stores[0] ?? null) : null;
+  const consolidatedCash =
+    !storeId && treasury.stores.length > 0 ? treasury : null;
+  const { totals, stores, currency } = pnl;
+  const scopeName =
+    storeId && stores.length > 0 ? stores[0].name : null;
+
+  const money = (v: number) => formatCurrency(v, currency);
+  const pct = (v: number) => (totals.revenue > 0 ? formatPercent((v / totals.revenue) * 100) : "—");
+  const profitDisplay = money(totals.netProfit);
+  const profitTitle = formatProfitBreakdown(
+    totals,
+    totals.adSpend,
+    money,
+    pnl.cogsIncomplete
+      ? { note: pnl.missingCogsMessage.replace(/\.$/, "") }
+      : undefined,
+  );
+
+  const lines: Array<{
+    label: string;
+    value: number;
+    tone: string;
+    share?: number;
+  }> = [
+    { label: "Receita líquida", value: totals.revenue, tone: "" },
+    { label: "COGS", value: -totals.cogs, tone: "text-negative", share: totals.cogs },
+    { label: "Envio", value: -totals.shipping, tone: "text-negative", share: totals.shipping },
+    { label: "Taxas de transação", value: -totals.fees, tone: "text-negative", share: totals.fees },
+    { label: "Ad Spend", value: -totals.adSpend, tone: "text-negative", share: totals.adSpend },
+  ];
+  if (totals.operatingExpenses > 0) {
+    lines.push({
+      label: "Apps e fixos",
+      value: -totals.operatingExpenses,
+      tone: "text-negative",
+      share: totals.operatingExpenses,
+    });
+  }
+  if (totals.refunds > 0) {
+    lines.push({
+      label: "Reembolsos (já na receita)",
+      value: totals.refunds,
+      tone: "text-muted-foreground",
+      share: totals.refunds,
+    });
+  }
+
+  const scopeQs = scopeQueryFromInput({ period, from, to, dates, store: storeId });
+  const adsHref = scopeQs ? `/anuncios?${scopeQs}` : "/anuncios";
+  const pnlExportHref = scopeQs
+    ? `/api/export/pnl?${scopeQs}`
+    : "/api/export/pnl";
+
+  await connectToDatabase();
+  const storeDocs = await Store.find(storeQueryForUser(user))
+    .select("name ianaTimezone")
+    .lean();
+  const storeNames = new Map(storeDocs.map((s) => [String(s._id), s.name]));
+  const storeOptions = storeDocs.map((s) => ({
+    id: String(s._id),
+    name: s.name,
+  }));
+  const scopedStoreDoc = storeId
+    ? storeDocs.find((s) => String(s._id) === storeId)
+    : null;
+  const financasTz = scopedStoreDoc
+    ? normalizeStoreTimezone(scopedStoreDoc.ianaTimezone)
+    : dominantStoreTimezone(storeDocs);
+  const periodFilter = periodToDateKeys(
+    resolvePeriodForStore({ period, from, to, dates }, financasTz),
+  );
+  const expenses = await listWorkspaceExpenses(
+    user.workspaceId,
+    storeNames,
+    currency,
+  );
+  const expensesInPeriodCount = expenses.filter((e) =>
+    expenseAppliesInPeriod(
+      {
+        amountBase: e.amountBase,
+        frequency: e.frequency,
+        startDateKey: e.startDateKey,
+        endDateKey: e.endDateKey,
+      },
+      periodFilter,
+    ),
+  ).length;
+  const canEditExpenses = ["owner", "admin", "editor"].includes(user.role);
+  const fixedMonthly = businessMode
+    ? await sumWorkspaceMonthlyFixedBase(user.workspaceId)
+    : 0;
+
+  const resumoPanel = (
+    <>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="rounded-lg border border-border bg-background p-4">
+          <p className="text-xs font-medium text-muted-foreground">Receita</p>
+          <p className="mt-1 text-xl font-semibold tabular-nums" data-sensitive>
+            {money(totals.revenue)}
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-background p-4">
+          <p className="text-xs font-medium text-muted-foreground">Custos totais</p>
+          <p className="mt-1 text-xl font-semibold tabular-nums" data-sensitive>
+            {money(
+              totals.cogs +
+                totals.shipping +
+                totals.fees +
+                totals.adSpend +
+                totals.operatingExpenses,
+            )}
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-background p-4">
+          <p className="text-xs font-medium text-muted-foreground">Lucro líquido</p>
+          <p
+            className={`mt-1 text-xl font-semibold tabular-nums ${totals.netProfit >= 0 ? "text-positive" : "text-negative"}`}
+            title={profitTitle}
+            data-sensitive
+          >
+            {profitDisplay}
+          </p>
+        </div>
+        <div className="rounded-lg border border-border bg-background p-4">
+          <p className="text-xs font-medium text-muted-foreground">Margem</p>
+          <p
+            className={`mt-1 text-xl font-semibold tabular-nums ${totals.margin >= 0 ? "" : "text-negative"}`}
+            data-sensitive
+          >
+            {formatPercent(totals.margin)}
+          </p>
+        </div>
+      </div>
+
+      {consolidatedCash && (
+        <div className="mt-4 rounded-lg border border-border bg-background p-4 sm:p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-medium text-muted-foreground">
+                Saldo em conta (banca)
+              </p>
+              <p
+                className={cn(
+                  "mt-1 text-2xl font-semibold tabular-nums",
+                  consolidatedCash.totals.cashOnHand >= 0
+                    ? "text-positive"
+                    : "text-negative",
+                )}
+                title={consolidatedCash.totals.cashOnHandTitle}
+                data-sensitive
+              >
+                {consolidatedCash.totals.cashOnHandFmt}
+              </p>
+              <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
+                <div>
+                  <dt className="text-muted-foreground">Saldo inicial</dt>
+                  <dd className="tabular-nums font-medium" data-sensitive>
+                    {money(
+                      consolidatedCash.stores.reduce(
+                        (s, l) => s + l.startingBalance,
+                        0,
+                      ),
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Payouts recebidos</dt>
+                  <dd className="tabular-nums font-medium text-positive" data-sensitive>
+                    {consolidatedCash.totals.receivedFmt}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Saídas</dt>
+                  <dd className="tabular-nums font-medium text-negative" data-sensitive>
+                    −{consolidatedCash.totals.outflowsTotalFmt}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted-foreground">Capital − levant.</dt>
+                  <dd className="tabular-nums font-medium" data-sensitive>
+                    {consolidatedCash.totals.manualIn > 0 ||
+                    consolidatedCash.totals.manualOut > 0
+                      ? `${consolidatedCash.totals.manualInFmt} / −${consolidatedCash.totals.manualOutFmt}`
+                      : "—"}
+                  </dd>
+                </div>
+              </dl>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Projecção desde o início de cada loja — não é o extracto do banco.
+                Soma dos saldos iniciais de cada loja.
+              </p>
+              {consolidatedCash.warnings.length > 0 && (
+                <ul className="mt-2 space-y-1 text-xs text-warning">
+                  {consolidatedCash.warnings.map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="text-right">
+              <p className="text-xs font-medium text-muted-foreground">
+                Com a receber
+              </p>
+              <p
+                className="mt-1 text-lg font-semibold tabular-nums"
+                title={consolidatedCash.totals.projectedCashTitle}
+                data-sensitive
+              >
+                {consolidatedCash.totals.projectedCashFmt}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Em conta + Shopify por pagar
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-5">
+        <h2 className="text-lg font-semibold">Demonstração de resultados</h2>
+        <p className="text-sm text-muted-foreground">
+          Onde está a ir o dinheiro no período seleccionado.
+        </p>
+        <div className="mt-3 divide-y divide-border rounded-lg border border-border">
+          {lines.map((l) => (
+            <div key={l.label} className="flex items-center justify-between px-4 py-3">
+              <span className="text-sm">{l.label}</span>
+              <div className="flex items-center gap-4">
+                {"share" in l && l.share !== undefined && (
+                  <span
+                    className="w-12 text-right text-xs text-muted-foreground tabular-nums"
+                    data-sensitive
+                  >
+                    {pct(l.share)}
+                  </span>
+                )}
+                <span
+                  className={`w-32 text-right text-sm tabular-nums ${l.tone}`}
+                  data-sensitive
+                >
+                  {money(l.value)}
+                </span>
+              </div>
+            </div>
+          ))}
+          <div className="flex items-center justify-between bg-muted px-4 py-3">
+            <span className="text-sm font-semibold">Lucro líquido</span>
+            <span
+              className={`w-32 text-right text-sm font-semibold tabular-nums ${totals.netProfit >= 0 ? "text-positive" : "text-negative"}`}
+              title={profitTitle}
+              data-sensitive
+            >
+              {profitDisplay}
+            </span>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  const storeTablePanel =
+    !scopeName && stores.length > 0 ? (
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[800px] text-sm">
+          <thead>
+            <tr className="text-left text-xs font-medium text-muted-foreground">
+              <th className="px-5 py-3">Loja</th>
+              <th className="px-5 py-3 text-right">Receita</th>
+              <th className="px-5 py-3 text-right">COGS</th>
+              <th className="px-5 py-3 text-right">Ad Spend</th>
+              <th className="px-5 py-3 text-right">Taxas</th>
+              <th className="px-5 py-3 text-right">Reembolsos</th>
+              <th className="px-5 py-3 text-right">Lucro</th>
+              <th className="px-5 py-3 text-right">Margem</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stores.map((s) => (
+              <tr key={s.name} className="border-t border-border hover:bg-muted">
+                <td className="px-5 py-3 font-medium" data-sensitive>
+                  {s.name}
+                </td>
+                <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                  {money(s.revenue)}
+                </td>
+                <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                  {money(s.cogs)}
+                </td>
+                <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                  {money(s.adSpend)}
+                </td>
+                <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                  {money(s.fees)}
+                </td>
+                <td className="px-5 py-3 text-right tabular-nums" data-sensitive>
+                  {money(s.refunds)}
+                </td>
+                <td
+                  className={`px-5 py-3 text-right tabular-nums ${s.netProfit >= 0 ? "text-positive" : "text-negative"}`}
+                  data-sensitive
+                >
+                  {money(s.netProfit)}
+                </td>
+                <td
+                  className={`px-5 py-3 text-right tabular-nums ${s.margin >= 0 ? "" : "text-negative"}`}
+                  data-sensitive
+                >
+                  {formatPercent(s.margin)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : undefined;
+
+  const expensesPanel = (
+    <ExpensesPanel
+      expenses={expenses}
+      stores={storeOptions}
+      canEdit={canEditExpenses}
+      baseCurrency={currency}
+      periodFilter={periodFilter}
+      embedded
+    />
+  );
+
+  return (
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {scopeName ? (
+            <>
+              Resumo · <span data-sensitive>{scopeName}</span>
+            </>
+          ) : (
+            "Lucro & Finanças"
+          )}
+        </h1>
+        <p className="text-sm text-muted-foreground">
+          {scopeName
+            ? `Caixa acumulada e P&L do período · ${pnl.periodLabel}.`
+            : `P&L do período · ${pnl.periodLabel}. Banca projectada no Resumo e em Caixa.`}
+        </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {!storeId && (
+            <Suspense fallback={null}>
+              <FinancasModeToggle />
+            </Suspense>
+          )}
+          <ExportFormatLinks href={pnlExportHref} />
+          <ScopeLink
+            href="/cogs"
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted"
+          >
+            <Boxes className="h-4 w-4" />
+            COGS
+          </ScopeLink>
+          <Link
+            href={adsHref}
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted"
+          >
+            <Megaphone className="h-4 w-4" />
+            Ad Spend
+          </Link>
+        </div>
+      </div>
+
+      <DataWarnings
+        cogsIncomplete={pnl.cogsIncomplete}
+        missingCogsCount={pnl.missingCogsCount}
+        missingCogsMessage={pnl.missingCogsMessage}
+        missingAdSpendDays={pnl.missingAdSpendDays}
+        adsHref={adsHref}
+      />
+
+      {businessMode && (
+        <BusinessPnlPanel
+          totals={totals}
+          currency={currency}
+          fixedMonthly={fixedMonthly}
+          storeCount={stores.length}
+        />
+      )}
+
+      <FinancasView
+        scopeName={scopeName}
+        hasStoreCash={Boolean(storeCash || consolidatedCash)}
+        hasStoreTable={!scopeName && stores.length > 0}
+        expenseCount={expensesInPeriodCount}
+        resumo={resumoPanel}
+        storeCash={
+          storeCash ? (
+            <StoreCashFlowSection
+              cash={storeCash}
+              periodFilter={periodFilter}
+              embedded
+            />
+          ) : consolidatedCash ? (
+            <ConsolidatedCashSection treasury={consolidatedCash} />
+          ) : undefined
+        }
+        storeTable={storeTablePanel}
+        expenses={expensesPanel}
+      />
+    </div>
+  );
+}

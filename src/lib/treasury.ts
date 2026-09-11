@@ -1,0 +1,906 @@
+import "server-only";
+import mongoose from "mongoose";
+import { connectToDatabase } from "@/lib/db";
+import { formatCurrency } from "@/lib/utils";
+import { Store } from "@/models/Store";
+import { Workspace } from "@/models/Workspace";
+import { Payout } from "@/models/Payout";
+import { BalanceTransaction } from "@/models/BalanceTransaction";
+import { Order } from "@/models/Order";
+import { sumAdSpendForPeriod } from "@/lib/ad-spend";
+import { moneyToBase } from "@/lib/fx";
+import { resolvePayoutNetBase } from "@/lib/payout-shopify-fx";
+import {
+  cogsSumExprForMode,
+  shippingSumBaseExpr,
+} from "@/lib/order-money";
+import { mergePaidOrderFilter } from "@/lib/order-financial-status";
+import type { CogsMode } from "@/lib/cogs-modes";
+import { endOfDay, formatRangeLabel, orderDateMatch } from "@/lib/period";
+import {
+  dateKeyInTimezone,
+  normalizeStoreTimezone,
+  orderDateMatchInTimezone,
+} from "@/lib/store-timezone";
+import { sumManualCogsForPeriod } from "@/lib/manual-cogs";
+import {
+  sumEuCategoryFeesForPeriod,
+  appliesEuCategoryFees,
+} from "@/lib/eu-category-fees";
+import { canAccessStore, type StoreAccess } from "@/lib/store-access";
+import { NON_ARCHIVED_STORE_FILTER } from "@/lib/store-scope";
+import { sumManualCashByStores } from "@/lib/cash-entries";
+import { resolveLastSyncedAtForStoreIds } from "@/lib/last-sync-at";
+import { buildExternalGatewayTreasury } from "@/lib/external-gateway-treasury";
+import {
+  loadWorkspaceExpensesLean,
+  sumLoadedExpenses,
+  sumLoadedWorkspaceExpenses,
+} from "@/lib/expenses";
+import type { IncomingDayLine } from "@/lib/treasury-day-lines";
+import { mergeIncomingDayLines } from "@/lib/treasury-day-lines";
+
+export type { IncomingDayLine } from "@/lib/treasury-day-lines";
+
+/** Payouts já criados (agendados/a caminho) — dinheiro já alocado, fora do saldo por pagar. */
+export const ALLOCATED_PAYOUT_STATUSES = new Set([
+  "scheduled",
+  "in_transit",
+  "action_required",
+]);
+
+/**
+ * Loja com Shopify Payments activo (saldo/payouts sincronizados).
+ */
+export function isShopifyPaymentsActive(
+  paymentsBalanceUpdatedAt: Date | string | null | undefined,
+  paymentsBalance: number | null | undefined,
+  payoutCount: number,
+): boolean {
+  if (paymentsBalanceUpdatedAt) return true;
+  if ((paymentsBalance ?? 0) > 0) return true;
+  return payoutCount > 0;
+}
+
+export function shouldUseExternalGatewayTreasury(
+  businessDays: number | null | undefined,
+): boolean {
+  return Boolean(businessDays && businessDays > 0);
+}
+
+/**
+ * Total Shopify a receber sem double-count:
+ * vendas por liquidar + payouts agendados/a caminho (disjuntos).
+ */
+export function computeShopifyPendingTotal(opts: {
+  /** Saldo API Shopify (por pagar). */
+  available: number;
+  /** Soma das balance transactions pending importadas. */
+  pendingTxTotal: number;
+  /** Payouts scheduled / in_transit / action_required. */
+  allocatedIncoming: number;
+}): { unallocated: number; shopifyPending: number } {
+  const unallocated =
+    opts.pendingTxTotal > 0 ? opts.pendingTxTotal : opts.available;
+  return {
+    unallocated,
+    shopifyPending: unallocated + opts.allocatedIncoming,
+  };
+}
+
+export type StoreTreasuryLine = {
+  storeId: string;
+  storeName: string;
+  currency: string;
+  /** Data desde a qual contamos entradas/saídas (saldo inicial ou início da loja). */
+  sinceDate: string | null;
+  sinceLabel: string;
+  /** Saldo na Shopify (por pagar no próximo payout). */
+  available: number;
+  availableFmt: string;
+  /** Payouts agendados / a caminho (total). */
+  incoming: number;
+  incomingFmt: string;
+  /** Já recebido no banco (desde saldo inicial ou 90d). */
+  received: number;
+  receivedFmt: string;
+  startingBalance: number;
+  startingBalanceFmt: string;
+  startingBalanceDate: string | null;
+  /** COGS + envio + ads desde `sinceDate`. */
+  outflowsCogs: number;
+  outflowsCogsFmt: string;
+  outflowsShipping: number;
+  outflowsShippingFmt: string;
+  outflowsAdSpend: number;
+  outflowsAdSpendFmt: string;
+  /** Apps / mensalidades / despesas manuais (Finanças) desde `sinceDate`. */
+  outflowsOpEx: number;
+  outflowsOpExFmt: string;
+  outflowsTotal: number;
+  outflowsTotalFmt: string;
+  /** Capital injectado manualmente desde `sinceDate`. */
+  manualIn: number;
+  manualInFmt: string;
+  /** Levantamentos manuais desde `sinceDate`. */
+  manualOut: number;
+  manualOutFmt: string;
+  /** Por pagar na Shopify + payouts a caminho + gateway externo projectado. */
+  shopifyPending: number;
+  shopifyPendingFmt: string;
+  shopifyPendingTitle: string;
+  /** Dias úteis configurados para payout de gateway externo (null = só Shopify Payments). */
+  externalGatewayPayoutBusinessDays: number | null;
+  /** Saldo em conta ≈ inicial + recebido − saídas conhecidas. */
+  cashOnHand: number;
+  cashOnHandFmt: string;
+  cashOnHandTitle: string;
+  /** Com o que ainda vem da Shopify (por pagar + a caminho). */
+  projectedCash: number;
+  projectedCashFmt: string;
+  projectedCashTitle: string;
+  /** @deprecated usar projectedCash — mantido para compatibilidade */
+  projected: number;
+  projectedFmt: string;
+  projectedTitle: string;
+  incomingByDay: IncomingDayLine[];
+  /** Payouts já pagos (entrada na conta), por dia. */
+  receivedByDay: IncomingDayLine[];
+  payoutsError: string | null;
+  /** Avisos sobre configuração ou dados que podem inflacionar o saldo. */
+  warnings: string[];
+  /** Origem do «recebido» no saldo em conta. */
+  receivedSource: "shopify_payouts" | "external_gateway" | "mixed";
+  /** Payouts Shopify Payments já na conta (modo misto). */
+  receivedShopify: number;
+  receivedShopifyFmt: string;
+  /** Projeção gateway externo já «caída» na conta (modo misto). */
+  receivedExternal: number;
+  receivedExternalFmt: string;
+};
+
+export type WorkspaceTreasury = {
+  currency: string;
+  stores: StoreTreasuryLine[];
+  totals: {
+    available: number;
+    availableFmt: string;
+    incoming: number;
+    incomingFmt: string;
+    received: number;
+    receivedFmt: string;
+    outflowsTotal: number;
+    outflowsTotalFmt: string;
+    outflowsOpEx: number;
+    outflowsOpExFmt: string;
+    manualIn: number;
+    manualInFmt: string;
+    manualOut: number;
+    manualOutFmt: string;
+    shopifyPending: number;
+    shopifyPendingFmt: string;
+    cashOnHand: number;
+    cashOnHandFmt: string;
+    cashOnHandTitle: string;
+    projectedCash: number;
+    projectedCashFmt: string;
+    projectedCashTitle: string;
+    projected: number;
+    projectedFmt: string;
+    projectedTitle: string;
+  };
+  incomingByDay: IncomingDayLine[];
+  receivedByDay: IncomingDayLine[];
+  generatedAt: string;
+  lastSyncedAt: string | null;
+  /** Avisos consolidados das lojas. */
+  warnings: string[];
+};
+
+function normStatus(s?: string | null) {
+  return (s ?? "").toLowerCase();
+}
+
+function dayKey(d: Date | string | null | undefined): string | null {
+  if (!d) return null;
+  const date = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+function dayLabel(key: string) {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("pt-PT", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+}
+
+function payoutReceivedAt(p: {
+  paidAt?: Date | null;
+  issuedAt?: Date | null;
+}): Date | null {
+  if (p.paidAt) return new Date(p.paidAt);
+  if (p.issuedAt) return new Date(p.issuedAt);
+  return null;
+}
+
+function countsTowardReceived(
+  p: { status?: string | null; paidAt?: Date | null; issuedAt?: Date | null },
+  startDate: Date | null,
+  sinceFallback: Date,
+): boolean {
+  if (normStatus(p.status) !== "paid") return false;
+  const at = payoutReceivedAt(p);
+  if (!at) return false;
+  if (startDate) return at >= startDate;
+  return at >= sinceFallback;
+}
+
+async function buildReceivedByDay(
+  payouts: Array<{
+    status?: string | null;
+    paidAt?: Date | null;
+    issuedAt?: Date | null;
+    net?: number | null;
+    currency?: string | null;
+  }>,
+  startDate: Date | null,
+  sinceFallback: Date,
+  fmt: (v: number) => string,
+  convertNet: (p: {
+    net?: number | null;
+    currency?: string | null;
+    paidAt?: Date | null;
+    issuedAt?: Date | null;
+  }) => Promise<number>,
+): Promise<IncomingDayLine[]> {
+  const map = new Map<string, number>();
+
+  for (const p of payouts) {
+    if (!countsTowardReceived(p, startDate, sinceFallback)) continue;
+    const at = payoutReceivedAt(p)!;
+    const day = dayKey(at);
+    if (!day) continue;
+    const amount = await convertNet(p);
+    map.set(day, (map.get(day) ?? 0) + amount);
+  }
+
+  return [...map.entries()]
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([date, amount]) => ({
+      date,
+      dateLabel: dayLabel(date),
+      amount,
+      amountFmt: fmt(amount),
+      kind: "received" as const,
+      kindLabel: "Recebido",
+    }));
+}
+
+async function buildIncomingByDay(
+  payouts: Array<{
+    status?: string | null;
+    issuedAt?: Date | null;
+    createdAt?: Date;
+    net?: number | null;
+    currency?: string | null;
+  }>,
+  pendingTx: Array<{
+    transactionDate: Date;
+    net?: number | null;
+    currency?: string | null;
+  }>,
+  fmt: (v: number) => string,
+  convertPayoutNet: (p: {
+    net?: number | null;
+    currency?: string | null;
+    issuedAt?: Date | null;
+    createdAt?: Date;
+  }) => Promise<number>,
+  convertTxNet: (bt: {
+    transactionDate: Date;
+    net?: number | null;
+    currency?: string | null;
+  }) => Promise<number>,
+): Promise<IncomingDayLine[]> {
+  const map = new Map<string, { payout: number; pending: number }>();
+
+  for (const p of payouts) {
+    const st = normStatus(p.status);
+    if (!ALLOCATED_PAYOUT_STATUSES.has(st)) continue;
+    const day = dayKey(p.issuedAt ?? p.createdAt);
+    if (!day) continue;
+    const row = map.get(day) ?? { payout: 0, pending: 0 };
+    row.payout += await convertPayoutNet(p);
+    map.set(day, row);
+  }
+
+  for (const bt of pendingTx) {
+    const day = dayKey(bt.transactionDate);
+    if (!day) continue;
+    const row = map.get(day) ?? { payout: 0, pending: 0 };
+    row.pending += await convertTxNet(bt);
+    map.set(day, row);
+  }
+
+  const lines: IncomingDayLine[] = [];
+  for (const [date, amounts] of map.entries()) {
+    if (amounts.payout > 0) {
+      lines.push({
+        date,
+        dateLabel: dayLabel(date),
+        amount: amounts.payout,
+        amountFmt: fmt(amounts.payout),
+        kind: "payout",
+        kindLabel: "Payout agendado",
+        detailLabel: "Previsto na conta neste dia",
+      });
+    }
+    if (amounts.pending > 0) {
+      lines.push({
+        date,
+        dateLabel: dayLabel(date),
+        amount: amounts.pending,
+        amountFmt: fmt(amounts.pending),
+        kind: "pending",
+        kindLabel: "Vendas por liquidar",
+        detailLabel: "Data da venda — payout num dia útil",
+      });
+    }
+  }
+
+  return lines.sort((a, b) => {
+    const cmp = a.date.localeCompare(b.date);
+    if (cmp !== 0) return cmp;
+    return a.kind === "payout" ? -1 : 1;
+  });
+}
+
+function mergeIncomingByDay(
+  lines: IncomingDayLine[],
+  currency: string,
+): IncomingDayLine[] {
+  return mergeIncomingDayLines(lines, currency);
+}
+
+async function sumOrderOutflowsSince(
+  storeId: mongoose.Types.ObjectId,
+  since: Date,
+  cogsMode: CogsMode,
+  timeZone?: string | null,
+): Promise<{ cogs: number; shipping: number }> {
+  const slice = { start: since, end: endOfDay(new Date()) };
+  const tz = timeZone ? normalizeStoreTimezone(timeZone) : null;
+  const dateMatch = tz
+    ? orderDateMatchInTimezone(slice, tz)
+    : orderDateMatch(slice);
+
+  let cogs = 0;
+  if (cogsMode === "day") {
+    cogs = await sumManualCogsForPeriod([storeId], slice, tz);
+  } else {
+    const cogsExpr = cogsSumExprForMode(cogsMode);
+    const cogsRows = await Order.aggregate<{ cogs: number }>([
+      { $match: mergePaidOrderFilter({ storeId, ...dateMatch }) },
+      { $group: { _id: null, cogs: cogsExpr } },
+    ]);
+    cogs = cogsRows[0]?.cogs ?? 0;
+    if (appliesEuCategoryFees(cogsMode)) {
+      cogs += await sumEuCategoryFeesForPeriod([storeId], slice, tz);
+    }
+  }
+
+  const shippingRows = await Order.aggregate<{ shipping: number }>([
+    { $match: mergePaidOrderFilter({ storeId, ...dateMatch }) },
+    { $group: { _id: null, shipping: shippingSumBaseExpr } },
+  ]);
+
+  return { cogs, shipping: shippingRows[0]?.shipping ?? 0 };
+}
+
+function resolveSinceDate(
+  startDate: Date | null,
+  fallback: Date,
+  importStartDate?: Date | null,
+  createdAt?: Date | null,
+): Date {
+  if (startDate) return startDate;
+  if (importStartDate) return new Date(importStartDate);
+  if (createdAt) return new Date(createdAt);
+  return fallback;
+}
+
+export async function buildWorkspaceTreasury(
+  workspaceId: string,
+  storeId?: string,
+  storeAccess: StoreAccess = "all",
+): Promise<WorkspaceTreasury> {
+  await connectToDatabase();
+
+  const empty: WorkspaceTreasury = {
+    currency: "EUR",
+    stores: [],
+    totals: {
+      available: 0,
+      availableFmt: formatCurrency(0, "EUR"),
+      incoming: 0,
+      incomingFmt: formatCurrency(0, "EUR"),
+      received: 0,
+      receivedFmt: formatCurrency(0, "EUR"),
+      outflowsTotal: 0,
+      outflowsTotalFmt: formatCurrency(0, "EUR"),
+      outflowsOpEx: 0,
+      outflowsOpExFmt: formatCurrency(0, "EUR"),
+      manualIn: 0,
+      manualInFmt: formatCurrency(0, "EUR"),
+      manualOut: 0,
+      manualOutFmt: formatCurrency(0, "EUR"),
+      shopifyPending: 0,
+      shopifyPendingFmt: formatCurrency(0, "EUR"),
+      cashOnHand: 0,
+      cashOnHandFmt: formatCurrency(0, "EUR"),
+      cashOnHandTitle: formatCurrency(0, "EUR"),
+      projectedCash: 0,
+      projectedCashFmt: formatCurrency(0, "EUR"),
+      projectedCashTitle: formatCurrency(0, "EUR"),
+      projected: 0,
+      projectedFmt: formatCurrency(0, "EUR"),
+      projectedTitle: formatCurrency(0, "EUR"),
+    },
+    incomingByDay: [],
+    receivedByDay: [],
+    generatedAt: new Date().toISOString(),
+    lastSyncedAt: null,
+    warnings: [],
+  };
+  if (!workspaceId) return empty;
+
+  const wsId = new mongoose.Types.ObjectId(workspaceId);
+  const workspace = await Workspace.findById(wsId).lean();
+  const currency = workspace?.baseCurrency ?? "EUR";
+  const fmt = (v: number, c = currency) => formatCurrency(v, c);
+
+  const storeQuery: Record<string, unknown> = {
+    workspaceId: wsId,
+    deletedAt: null,
+    ...NON_ARCHIVED_STORE_FILTER,
+  };
+  if (storeId) {
+    if (!canAccessStore(storeAccess, storeId)) return empty;
+    storeQuery._id = new mongoose.Types.ObjectId(storeId);
+  }
+
+  let stores = await Store.find(storeQuery)
+    .select(
+      "name currency cogsMode startingBalance startingBalanceDate importStartDate createdAt ianaTimezone paymentsBalance paymentsBalanceUpdatedAt payoutsError externalGatewayPayoutBusinessDays",
+    )
+    .lean();
+
+  if (storeAccess !== "all") {
+    stores = stores.filter((s) => canAccessStore(storeAccess, String(s._id)));
+  }
+
+  if (stores.length === 0) {
+    const fmt = (v: number) => formatCurrency(v, currency);
+    return {
+      ...empty,
+      currency,
+      totals: {
+        available: 0,
+        availableFmt: fmt(0),
+        incoming: 0,
+        incomingFmt: fmt(0),
+        received: 0,
+        receivedFmt: fmt(0),
+        outflowsTotal: 0,
+        outflowsTotalFmt: fmt(0),
+        outflowsOpEx: 0,
+        outflowsOpExFmt: fmt(0),
+        manualIn: 0,
+        manualInFmt: fmt(0),
+        manualOut: 0,
+        manualOutFmt: fmt(0),
+        shopifyPending: 0,
+        shopifyPendingFmt: fmt(0),
+        cashOnHand: 0,
+        cashOnHandFmt: fmt(0),
+        cashOnHandTitle: fmt(0),
+        projectedCash: 0,
+        projectedCashFmt: fmt(0),
+        projectedCashTitle: fmt(0),
+        projected: 0,
+        projectedFmt: fmt(0),
+        projectedTitle: fmt(0),
+      },
+    };
+  }
+
+  const storeIds = stores.map((s) => s._id);
+  const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+
+  const payouts = await Payout.find({
+    storeId: { $in: storeIds },
+  }).lean();
+
+  const pendingTx = await BalanceTransaction.find({
+    storeId: { $in: storeIds },
+    payoutStatus: "pending",
+  }).lean();
+
+  const outflowByStore = await Promise.all(
+    stores.map(async (s) => {
+      const startDate = s.startingBalanceDate
+        ? new Date(s.startingBalanceDate)
+        : null;
+      const since = resolveSinceDate(
+        startDate,
+        since90,
+        s.importStartDate,
+        s.createdAt,
+      );
+      const slice = { start: since, end: endOfDay(new Date()) };
+      const cogsMode = (s.cogsMode ?? "shopify") as CogsMode;
+      const [orderOut, adSpend] = await Promise.all([
+        sumOrderOutflowsSince(s._id, since, cogsMode, s.ianaTimezone),
+        sumAdSpendForPeriod(
+          [s._id],
+          slice,
+          normalizeStoreTimezone(s.ianaTimezone),
+        ),
+      ]);
+      return {
+        storeId: String(s._id),
+        since,
+        cogs: orderOut.cogs,
+        shipping: orderOut.shipping,
+        adSpend,
+      };
+    }),
+  );
+  const outflowMap = new Map(outflowByStore.map((o) => [o.storeId, o]));
+
+  const sinceByStore = new Map(
+    outflowByStore.map((o) => [o.storeId, o.since]),
+  );
+  const storeCurrencyByStore = new Map(
+    stores.map((s) => [String(s._id), (s.currency ?? currency).toUpperCase()]),
+  );
+  const manualCashMap = await sumManualCashByStores(
+    workspaceId,
+    storeIds,
+    sinceByStore,
+    currency,
+    storeCurrencyByStore,
+  );
+  const expenseRows = await loadWorkspaceExpensesLean(wsId);
+
+  const fmtBase = (v: number) => fmt(v, currency);
+
+  const lines: StoreTreasuryLine[] = await Promise.all(
+    stores.map(async (s) => {
+    const sid = String(s._id);
+    const storeTz = normalizeStoreTimezone(s.ianaTimezone);
+    /** Dia civil da loja — alinha gateway externo (payout ~07:00) com o dia útil, não UTC. */
+    const storeTodayKey = dateKeyInTimezone(new Date(), storeTz);
+    const storeCurrency = storeCurrencyByStore.get(sid) ?? currency;
+    const availableRaw = s.paymentsBalance ?? 0;
+    const startingBalanceRaw = s.startingBalance ?? 0;
+    const startDate = s.startingBalanceDate
+      ? new Date(s.startingBalanceDate)
+      : null;
+    const out = outflowMap.get(sid)!;
+    const since = out.since;
+    const sinceLabel = formatRangeLabel(since, endOfDay(new Date()));
+
+    const payoutToBase = async (p: {
+      net?: number | null;
+      netBase?: number | null;
+      currency?: string | null;
+      issuedAt?: Date | null;
+      createdAt?: Date;
+      paidAt?: Date | null;
+    }) => {
+      const date =
+        dayKey(p.paidAt ?? p.issuedAt ?? p.createdAt) ?? storeTodayKey;
+      return resolvePayoutNetBase(p, storeCurrency, currency, date);
+    };
+
+    const txToBase = async (bt: {
+      transactionDate: Date;
+      net?: number | null;
+      currency?: string | null;
+    }) => {
+      const date = dayKey(bt.transactionDate) ?? storeTodayKey;
+      const cur = (bt.currency ?? storeCurrency).toUpperCase();
+      return moneyToBase(bt.net ?? 0, cur, currency, date);
+    };
+
+    const storePayouts = payouts.filter((p) => String(p.storeId) === sid);
+    const storePendingTx = pendingTx.filter((bt) => String(bt.storeId) === sid);
+
+    let pendingTxTotal = 0;
+    for (const bt of storePendingTx) {
+      pendingTxTotal += await txToBase(bt);
+    }
+
+    let allocatedIncoming = 0;
+    for (const p of storePayouts) {
+      if (!ALLOCATED_PAYOUT_STATUSES.has(normStatus(p.status))) continue;
+      allocatedIncoming += await payoutToBase(p);
+    }
+
+    let incoming = allocatedIncoming;
+
+    let received = 0;
+    for (const p of storePayouts) {
+      // Mesma janela que as saídas (`since`), não só 90 dias — senão o saldo
+      // fica artificialmente negativo quando há COGS/ads antigos sem payouts.
+      if (!countsTowardReceived(p, startDate, since)) continue;
+      received += await payoutToBase(p);
+    }
+
+    const available = await moneyToBase(
+      availableRaw,
+      storeCurrency,
+      currency,
+      storeTodayKey,
+    );
+    const startingBalance = startingBalanceRaw;
+
+    const { unallocated, shopifyPending: shopifyPendingFromComponents } =
+      computeShopifyPendingTotal({
+        available,
+        pendingTxTotal,
+        allocatedIncoming,
+      });
+
+    const incomingByDay = await buildIncomingByDay(
+      storePayouts,
+      storePendingTx,
+      fmtBase,
+      payoutToBase,
+      txToBase,
+    );
+
+    const receivedByDay = await buildReceivedByDay(
+      storePayouts,
+      startDate,
+      since,
+      fmtBase,
+      payoutToBase,
+    );
+
+    const externalDays = s.externalGatewayPayoutBusinessDays ?? null;
+    const shopifyActive = isShopifyPaymentsActive(
+      s.paymentsBalanceUpdatedAt,
+      availableRaw,
+      storePayouts.length,
+    );
+    const useExternalGateway = shouldUseExternalGatewayTreasury(externalDays);
+    const externalGateway = useExternalGateway
+      ? await buildExternalGatewayTreasury(
+          s._id,
+          externalDays ?? 0,
+          since,
+          storeTodayKey,
+          s.ianaTimezone ?? null,
+          fmtBase,
+          shopifyActive,
+        )
+      : null;
+
+    const warnings: string[] = [];
+    if (startingBalanceRaw !== 0 && !startDate) {
+      warnings.push(
+        "Saldo inicial sem data — define a data do saldo em Definições ou o valor pode estar inflacionado.",
+      );
+    }
+
+    let receivedSource: StoreTreasuryLine["receivedSource"] = "shopify_payouts";
+    let receivedShopify = received;
+    let receivedExternal = 0;
+
+    /**
+     * Gateway externo: estimativa por encomenda (Stripe, PayPal, MB, etc.).
+     * Com Shopify Payments activo, exclui encomendas shopify_payments / feesSource real.
+     */
+    let incomingByDayFinal = mergeIncomingByDay(incomingByDay, currency);
+    let receivedByDayFinal = mergeIncomingByDay(receivedByDay, currency);
+
+    if (externalGateway) {
+      if (shopifyActive) {
+        receivedExternal = externalGateway.received;
+        received += externalGateway.received;
+        incoming += externalGateway.incoming;
+        incomingByDayFinal = mergeIncomingByDay(
+          [...incomingByDay, ...externalGateway.incomingByDay],
+          currency,
+        );
+        receivedByDayFinal = mergeIncomingByDay(
+          [...receivedByDay, ...externalGateway.receivedByDay],
+          currency,
+        );
+        receivedSource = "mixed";
+      } else {
+        receivedShopify = 0;
+        receivedExternal = externalGateway.received;
+        received = externalGateway.received;
+        incoming = externalGateway.incoming;
+        incomingByDayFinal = mergeIncomingByDay(
+          externalGateway.incomingByDay,
+          currency,
+        );
+        receivedByDayFinal = mergeIncomingByDay(
+          externalGateway.receivedByDay,
+          currency,
+        );
+        receivedSource = "external_gateway";
+      }
+    }
+
+    const outflowsOps = out.cogs + out.shipping + out.adSpend;
+    const expenseSlice = { start: since, end: endOfDay(new Date()) };
+    const storeOpEx = sumLoadedExpenses(expenseRows, expenseSlice, sid);
+    /** Numa loja isolada, contas partilhadas do workspace também saem da banca. */
+    const wsOpExForStore =
+      stores.length === 1
+        ? sumLoadedWorkspaceExpenses(expenseRows, expenseSlice)
+        : 0;
+    const outflowsOpEx = storeOpEx + wsOpExForStore;
+    const outflowsTotal = outflowsOps + outflowsOpEx;
+    const manual = manualCashMap.get(sid) ?? { manualIn: 0, manualOut: 0 };
+    /**
+     * Shopify: vendas por liquidar (unallocated) + payouts agendados/a caminho.
+     * Não somar status «pending» nos payouts — sobrepõe-se ao saldo API.
+     * Linhas «Vendas por liquidar» no timeline são breakdown do unallocated.
+     */
+    const shopifyPending =
+      externalGateway && !shopifyActive
+        ? incoming
+        : shopifyPendingFromComponents +
+          (shopifyActive && externalGateway ? externalGateway.incoming : 0);
+    const cashOnHand =
+      startingBalance +
+      received +
+      manual.manualIn -
+      outflowsTotal -
+      manual.manualOut;
+    const projectedCash = cashOnHand + shopifyPending;
+    const projected = projectedCash;
+
+    return {
+      storeId: sid,
+      storeName: s.name,
+      currency,
+      sinceDate: since.toISOString().slice(0, 10),
+      sinceLabel,
+      available: unallocated,
+      availableFmt: fmtBase(unallocated),
+      incoming,
+      incomingFmt: fmtBase(incoming),
+      received,
+      receivedFmt: fmtBase(received),
+      startingBalance,
+      startingBalanceFmt: fmtBase(startingBalance),
+      startingBalanceDate: startDate
+        ? startDate.toISOString().slice(0, 10)
+        : null,
+      outflowsCogs: out.cogs,
+      outflowsCogsFmt: fmtBase(out.cogs),
+      outflowsShipping: out.shipping,
+      outflowsShippingFmt: fmtBase(out.shipping),
+      outflowsAdSpend: out.adSpend,
+      outflowsAdSpendFmt: fmtBase(out.adSpend),
+      outflowsOpEx,
+      outflowsOpExFmt: fmtBase(outflowsOpEx),
+      outflowsTotal,
+      outflowsTotalFmt: fmtBase(outflowsTotal),
+      manualIn: manual.manualIn,
+      manualInFmt: fmtBase(manual.manualIn),
+      manualOut: manual.manualOut,
+      manualOutFmt: fmtBase(manual.manualOut),
+      shopifyPending,
+      shopifyPendingFmt: fmtBase(shopifyPending),
+      shopifyPendingTitle: fmtBase(shopifyPending),
+      externalGatewayPayoutBusinessDays: externalDays,
+      cashOnHand,
+      cashOnHandFmt: fmtBase(cashOnHand),
+      cashOnHandTitle: fmtBase(cashOnHand),
+      projectedCash,
+      projectedCashFmt: fmtBase(projectedCash),
+      projectedCashTitle: fmtBase(projectedCash),
+      projected,
+      projectedFmt: fmtBase(projected),
+      projectedTitle: fmtBase(projected),
+      incomingByDay: incomingByDayFinal,
+      receivedByDay: receivedByDayFinal,
+      payoutsError: s.payoutsError ?? null,
+      warnings,
+      receivedSource,
+      receivedShopify,
+      receivedShopifyFmt: fmtBase(receivedShopify),
+      receivedExternal,
+      receivedExternalFmt: fmtBase(receivedExternal),
+    };
+  }),
+  );
+
+  /** Despesas workspace uma vez no consolidado (não repartidas por loja). */
+  let workspaceOpExTotal = 0;
+  if (stores.length > 1 && lines.length > 0) {
+    const sinceKeys = lines
+      .map((l) => l.sinceDate)
+      .filter((k): k is string => Boolean(k))
+      .sort();
+    if (sinceKeys[0]) {
+      const wsSlice = {
+        start: new Date(`${sinceKeys[0]}T00:00:00.000Z`),
+        end: endOfDay(new Date()),
+      };
+      workspaceOpExTotal = sumLoadedWorkspaceExpenses(expenseRows, wsSlice);
+    }
+  }
+
+  const sum = (key: keyof StoreTreasuryLine) =>
+    lines.reduce((a, l) => a + (l[key] as number), 0);
+
+  const allIncomingByDay = mergeIncomingByDay(
+    lines.flatMap((l) => l.incomingByDay),
+    currency,
+  );
+
+  const allReceivedByDay = mergeIncomingByDay(
+    lines.flatMap((l) => l.receivedByDay),
+    currency,
+  );
+
+  const cashOnHandTotal = sum("cashOnHand") - workspaceOpExTotal;
+  const outflowsOpExTotal = sum("outflowsOpEx") + workspaceOpExTotal;
+  const outflowsTotal = sum("outflowsTotal") + workspaceOpExTotal;
+  const shopifyPendingTotal = sum("shopifyPending");
+  const projectedTotal = cashOnHandTotal + shopifyPendingTotal;
+  const manualInTotal = sum("manualIn");
+  const manualOutTotal = sum("manualOut");
+  const lastSyncedAt = await resolveLastSyncedAtForStoreIds(
+    stores.map((s) => String(s._id)),
+  );
+
+  return {
+    currency,
+    stores: lines.sort((a, b) => b.cashOnHand - a.cashOnHand),
+    totals: {
+      available: sum("available"),
+      availableFmt: fmt(sum("available")),
+      incoming: sum("incoming"),
+      incomingFmt: fmt(sum("incoming")),
+      received: sum("received"),
+      receivedFmt: fmt(sum("received")),
+      outflowsTotal,
+      outflowsTotalFmt: fmt(outflowsTotal),
+      outflowsOpEx: outflowsOpExTotal,
+      outflowsOpExFmt: fmt(outflowsOpExTotal),
+      manualIn: manualInTotal,
+      manualInFmt: fmt(manualInTotal),
+      manualOut: manualOutTotal,
+      manualOutFmt: fmt(manualOutTotal),
+      shopifyPending: shopifyPendingTotal,
+      shopifyPendingFmt: fmt(shopifyPendingTotal),
+      cashOnHand: cashOnHandTotal,
+      cashOnHandFmt: fmt(cashOnHandTotal),
+      cashOnHandTitle: fmt(cashOnHandTotal),
+      projectedCash: projectedTotal,
+      projectedCashFmt: fmt(projectedTotal),
+      projectedCashTitle: fmt(projectedTotal),
+      projected: projectedTotal,
+      projectedFmt: fmt(projectedTotal),
+      projectedTitle: fmt(projectedTotal),
+    },
+    incomingByDay: allIncomingByDay,
+    receivedByDay: allReceivedByDay,
+    generatedAt: new Date().toISOString(),
+    lastSyncedAt,
+    warnings: [...new Set(lines.flatMap((l) => l.warnings))],
+  };
+}

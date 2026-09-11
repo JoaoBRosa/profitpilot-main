@@ -1,0 +1,715 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { cookies } from "next/headers";
+import mongoose from "mongoose";
+import { z } from "zod";
+import { connectToDatabase } from "@/lib/db";
+import { getCurrentUser } from "@/lib/auth";
+import { createAdAccount, softDeleteAdAccount, updateAdAccountApiFees } from "@/lib/ad-accounts";
+import { AD_PLATFORMS, type AdPlatform } from "@/lib/ad-spend-platforms";
+import { assertStoreAccess, findStoreForUser } from "@/lib/store-scope";
+import { syncAdAccountsSpendForStore } from "@/lib/ad-api-sync";
+import {
+  listMetaAdAccounts,
+  MetaApiError,
+  verifyMetaAdAccountAccess,
+  type MetaAdAccountOption,
+} from "@/lib/meta-ads";
+import {
+  GoogleAdsApiError,
+  googleAdsServerConfigStatus,
+  isGooglePermissionError,
+  listGoogleAdAccounts,
+  resolveGoogleCustomerIdLocal,
+  resolveGoogleLoginCustomerId,
+  verifyGoogleAdAccountAccess,
+  type GoogleAdAccountOption,
+} from "@/lib/google-ads";
+import {
+  listTiktokAdvertisers,
+  TiktokAdsApiError,
+  verifyTiktokAdvertiserAccess,
+  type TiktokAdvertiserOption,
+} from "@/lib/tiktok-ads";
+import {
+  adOAuthLoginEmailCookie,
+  adOAuthTokenCookie,
+  legacyOAuthTokenCookie,
+} from "@/lib/ad-oauth";
+import {
+  getWorkspaceGoogleRefreshToken,
+  saveWorkspaceGoogleCredentialManual,
+  upsertWorkspaceGoogleCredential,
+} from "@/lib/ad-platform-credentials";
+
+export type AdAccountActionState = { ok?: boolean; error?: string };
+
+export type AdOAuthPending = {
+  token: string;
+  loginEmail?: string;
+};
+
+export type AdAccountsDiscoverState = {
+  platform?: AdPlatform;
+  meta?: MetaAdAccountOption[];
+  google?: GoogleAdAccountOption[];
+  tiktok?: TiktokAdvertiserOption[];
+  error?: string;
+};
+
+const ROLES_EDIT = ["owner", "admin", "editor"];
+
+const addSchema = z
+  .object({
+    platform: z.enum(AD_PLATFORMS),
+    externalAccountId: z.string().trim().min(3).max(64),
+    accountName: z.string().trim().max(120).optional(),
+    accessToken: z.string().trim().optional(),
+    refreshToken: z.string().trim().optional(),
+    allocation: z.coerce.number().min(1).max(100).optional(),
+    apiExtraFeeFixed: z.coerce.number().min(0).optional(),
+    apiAgencyFeePercent: z.coerce.number().min(0).max(100).optional(),
+    linkedLoginEmail: z.string().trim().max(200).optional(),
+    googleCredentialId: z.string().trim().optional(),
+    googleLoginCustomerId: z.string().trim().max(32).optional(),
+    /** Token Meta só no cookie httpOnly — nunca no browser. */
+    metaOAuthPending: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.platform === "google") {
+      const hasCredential =
+        Boolean(data.googleCredentialId?.trim()) &&
+        mongoose.isValidObjectId(data.googleCredentialId);
+      const hasToken = Boolean(data.refreshToken && data.refreshToken.length >= 10);
+      if (!hasCredential && !hasToken) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Escolhe um login Google do workspace ou indica refresh token.",
+          path: ["refreshToken"],
+        });
+      }
+    } else if (data.platform === "meta" && data.metaOAuthPending) {
+      /* token lido do cookie no servidor */
+    } else if (!data.accessToken || data.accessToken.length < 10) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Indica um access token válido.",
+        path: ["accessToken"],
+      });
+    }
+  });
+
+async function verifyPlatformAccount(
+  platform: AdPlatform,
+  externalAccountId: string,
+  accessToken?: string,
+  refreshToken?: string,
+  googleLoginCustomerId?: string,
+): Promise<{
+  name: string;
+  currency: string;
+  externalAccountId?: string;
+  loginCustomerId?: string;
+}> {
+  switch (platform) {
+    case "meta":
+      return verifyMetaAdAccountAccess(accessToken!, externalAccountId);
+    case "google":
+      if (!googleAdsServerConfigStatus().apiReady) {
+        const local = resolveGoogleCustomerIdLocal(externalAccountId);
+        return {
+          name: local.name,
+          currency: "EUR",
+          externalAccountId: local.id,
+        };
+      }
+      try {
+        return await verifyGoogleAdAccountAccess(
+          refreshToken!,
+          externalAccountId,
+          googleLoginCustomerId,
+        );
+      } catch (e) {
+        const msg = e instanceof GoogleAdsApiError ? e.message : String(e);
+        if (!isGooglePermissionError(msg)) throw e;
+
+        let loginCustomerId: string | undefined;
+        try {
+          loginCustomerId = await resolveGoogleLoginCustomerId(
+            refreshToken!,
+            externalAccountId,
+            googleLoginCustomerId,
+          );
+        } catch {
+          /* ignora */
+        }
+
+        const local = resolveGoogleCustomerIdLocal(externalAccountId);
+        return {
+          name: local.name,
+          currency: "EUR",
+          externalAccountId: local.id,
+          loginCustomerId,
+        };
+      }
+    case "tiktok":
+      return verifyTiktokAdvertiserAccess(accessToken!, externalAccountId);
+    default:
+      throw new Error("Plataforma inválida.");
+  }
+}
+
+export async function addAdAccountAction(
+  _prev: AdAccountActionState,
+  formData: FormData,
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão para editar." };
+  }
+
+  const storeId = String(formData.get("storeId") ?? "").trim();
+  if (!mongoose.isValidObjectId(storeId)) {
+    return { error: "Loja inválida." };
+  }
+  assertStoreAccess(user.storeAccess, storeId);
+
+  const parsed = addSchema.safeParse({
+    platform: formData.get("platform"),
+    externalAccountId: formData.get("externalAccountId"),
+    accountName: formData.get("accountName") || undefined,
+    accessToken: formData.get("accessToken") || undefined,
+    refreshToken: formData.get("refreshToken") || undefined,
+    allocation: formData.get("allocation") || 100,
+    apiExtraFeeFixed: formData.get("apiExtraFeeFixed") || 0,
+    apiAgencyFeePercent: formData.get("apiAgencyFeePercent") || 0,
+    linkedLoginEmail: formData.get("linkedLoginEmail") || undefined,
+    googleCredentialId: formData.get("googleCredentialId") || undefined,
+    googleLoginCustomerId: formData.get("googleLoginCustomerId") || undefined,
+    metaOAuthPending: formData.get("metaOAuthPending") === "1",
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Dados inválidos." };
+  }
+
+  await connectToDatabase();
+  const store = await findStoreForUser(user, storeId, "_id");
+  if (!store) return { error: "Loja não encontrada." };
+
+  const {
+    platform,
+    externalAccountId,
+    accountName,
+    accessToken,
+    refreshToken,
+    allocation,
+    apiExtraFeeFixed,
+    apiAgencyFeePercent,
+    linkedLoginEmail,
+    googleCredentialId,
+    googleLoginCustomerId,
+    metaOAuthPending,
+  } = parsed.data;
+
+  let refreshTokenResolved = refreshToken?.trim() ?? "";
+  let linkedEmailResolved = linkedLoginEmail ?? "";
+  let accessTokenResolved = accessToken?.trim() ?? "";
+
+  if (platform === "meta" && metaOAuthPending) {
+    const pending = await peekOAuthToken("meta", storeId);
+    if (!pending?.token) {
+      return { error: "Sessão OAuth Meta expirada — autoriza outra vez." };
+    }
+    accessTokenResolved = pending.token;
+    if (pending.loginEmail) linkedEmailResolved = pending.loginEmail;
+  }
+
+  if (platform === "google" && googleCredentialId) {
+    const cred = await getWorkspaceGoogleRefreshToken(
+      user.workspaceId,
+      googleCredentialId,
+    );
+    if (!cred) {
+      return { error: "Login Google do workspace não encontrado." };
+    }
+    refreshTokenResolved = cred.refreshToken;
+    if (!linkedEmailResolved) linkedEmailResolved = cred.loginEmail;
+  }
+
+  const replaceOther =
+    String(formData.get("replacePlatformAccount") ?? "") === "true";
+
+  try {
+    const verified = await verifyPlatformAccount(
+      platform,
+      externalAccountId,
+      accessTokenResolved || undefined,
+      platform === "google" ? refreshTokenResolved : refreshToken,
+      googleLoginCustomerId,
+    );
+    const externalIdResolved =
+      verified.externalAccountId ?? externalAccountId.trim();
+    const credentials =
+      platform === "google"
+        ? {
+            refreshToken: refreshTokenResolved,
+            ...(verified.loginCustomerId
+              ? { loginCustomerId: verified.loginCustomerId }
+              : {}),
+          }
+        : { accessToken: accessTokenResolved };
+
+    await createAdAccount({
+      workspaceId: new mongoose.Types.ObjectId(user.workspaceId),
+      storeId: store._id,
+      platform,
+      externalAccountId: externalIdResolved,
+      accountName: accountName || verified.name,
+      credentials,
+      allocation,
+      apiExtraFeeFixed: apiExtraFeeFixed ?? 0,
+      apiAgencyFeePercent: apiAgencyFeePercent ?? 0,
+      linkedLoginEmail: linkedEmailResolved,
+      replaceOtherOnPlatform: replaceOther,
+    });
+    if (platform === "meta" && metaOAuthPending) {
+      await clearOAuthToken("meta", storeId);
+    }
+    // Sync em background — não bloquear a UI a «assumir» a conta.
+    void syncAdAccountsSpendForStore(storeId).catch(() => {});
+    revalidatePath("/anuncios");
+    revalidatePath("/definicoes");
+    return { ok: true };
+  } catch (e) {
+    const msg =
+      e instanceof MetaApiError ||
+      e instanceof GoogleAdsApiError ||
+      e instanceof TiktokAdsApiError
+        ? e.message
+        : e instanceof Error
+          ? e.message
+          : "Não foi possível guardar.";
+    if (msg.includes("duplicate key")) {
+      return { error: "Esta conta já está ligada a esta loja." };
+    }
+    return { error: msg };
+  }
+}
+
+/** Lista contas Google Ads com um login já guardado no workspace. */
+export async function discoverGoogleCredentialAction(
+  credentialId: string,
+): Promise<AdAccountsDiscoverState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+  const cred = await getWorkspaceGoogleRefreshToken(
+    user.workspaceId,
+    credentialId,
+  );
+  if (!cred) return { error: "Login Google não encontrado." };
+  const res = await discoverAdAccountsAction("google", cred.refreshToken);
+  if (res.error && cred.loginEmail) {
+    return {
+      error: `${res.error} (Gmail usado: ${cred.loginEmail})`,
+    };
+  }
+  return res;
+}
+
+export async function saveWorkspaceGoogleLoginAction(
+  _prev: AdAccountActionState,
+  formData: FormData,
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+
+  const loginEmail = String(formData.get("loginEmail") ?? "").trim();
+  const refreshToken = String(formData.get("refreshToken") ?? "").trim();
+  if (!loginEmail || !refreshToken) {
+    return { error: "Email e refresh token são obrigatórios." };
+  }
+
+  try {
+    await saveWorkspaceGoogleCredentialManual(
+      user.workspaceId,
+      loginEmail,
+      refreshToken,
+    );
+    revalidatePath("/anuncios");
+    revalidatePath("/definicoes");
+    return { ok: true };
+  } catch (e) {
+    return {
+      error: e instanceof Error ? e.message : "Não foi possível guardar.",
+    };
+  }
+}
+
+/** Lista contas acessíveis com o token (passo 1 do assistente). */
+export async function discoverAdAccountsAction(
+  platform: AdPlatform,
+  token: string,
+): Promise<AdAccountsDiscoverState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+
+  const trimmed = token.trim();
+  if (trimmed.length < 10) {
+    return { error: "Indica um token válido." };
+  }
+
+  try {
+    if (platform === "meta") {
+      const accounts = await listMetaAdAccounts(trimmed);
+      if (!accounts.length) {
+        return {
+          error:
+            "Nenhuma ad account Meta encontrada. Confirma ads_read, que o convite foi aceite, e que o token é do utilizador que recebeu o acesso (ou System User com permissão).",
+        };
+      }
+      return { platform, meta: accounts };
+    }
+    if (platform === "google") {
+      if (!googleAdsServerConfigStatus().apiReady) {
+        return {
+          error:
+            "Pesquisa automática indisponível — falta GOOGLE_ADS_DEVELOPER_TOKEN na Vercel. Usa «Customer ID manual» com o ID da conta (ex: 962-828-5107).",
+        };
+      }
+      const accounts = await listGoogleAdAccounts(trimmed);
+      if (!accounts.length) {
+        return {
+          error:
+            "Nenhuma conta Google Ads listada com este Gmail — confirma que é o mesmo que aceitou o convite, ou usa Customer ID manual.",
+        };
+      }
+      return { platform, google: accounts };
+    }
+    const accounts = await listTiktokAdvertisers(trimmed);
+    if (!accounts.length) {
+      return { error: "Nenhum advertiser TikTok encontrado com este token." };
+    }
+    return { platform: "tiktok", tiktok: accounts };
+  } catch (e) {
+    const msg =
+      e instanceof MetaApiError ||
+      e instanceof GoogleAdsApiError ||
+      e instanceof TiktokAdsApiError
+        ? e.message
+        : e instanceof Error
+          ? e.message
+          : "Não foi possível listar contas.";
+    return { error: msg };
+  }
+}
+
+/** @deprecated usar discoverAdAccountsAction */
+export async function listMetaAdAccountsAction(
+  accessToken: string,
+): Promise<{ accounts?: MetaAdAccountOption[]; error?: string }> {
+  const res = await discoverAdAccountsAction("meta", accessToken);
+  return { accounts: res.meta, error: res.error };
+}
+
+export async function deleteAdAccountAction(
+  _prev: AdAccountActionState,
+  formData: FormData,
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+
+  const accountId = String(formData.get("accountId") ?? "").trim();
+  if (!accountId) return { error: "Conta em falta." };
+
+  const ok = await softDeleteAdAccount(user.workspaceId, accountId);
+  if (!ok) return { error: "Conta não encontrada." };
+  revalidatePath("/anuncios");
+  revalidatePath("/definicoes");
+  return { ok: true };
+}
+
+export async function deleteWorkspaceGoogleLoginAction(
+  _prev: AdAccountActionState,
+  formData: FormData,
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+
+  const credentialId = String(formData.get("credentialId") ?? "").trim();
+  if (!credentialId) return { error: "Login em falta." };
+
+  const { softDeleteWorkspaceCredential } = await import(
+    "@/lib/ad-platform-credentials"
+  );
+  const ok = await softDeleteWorkspaceCredential(
+    user.workspaceId,
+    credentialId,
+    "google",
+  );
+  if (!ok) return { error: "Gmail não encontrado." };
+  revalidatePath("/anuncios");
+  revalidatePath("/definicoes");
+  return { ok: true };
+}
+
+/**
+ * Sync rápido: só hoje + ontem (para o botão "Actualizar" e auto-sync).
+ * Muito mais rápido que o backfill completo (2 dias vs 45).
+ */
+export async function syncAdAccountsNowAction(
+  storeId: string,
+  options?: { fullBackfill?: boolean },
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  const store = await findStoreForUser(user, storeId, "_id");
+  if (!store) return { error: "Loja não encontrada ou sem acesso." };
+  try {
+    if (options?.fullBackfill) {
+      // Backfill completo (45 dias) — só para cron ou pedido explícito
+      const { syncMissingAdMetricsForStore } = await import(
+        "@/lib/ad-metrics-backfill"
+      );
+      await syncMissingAdMetricsForStore(storeId, { force: true, maxDays: 45 });
+    } else {
+      // Sync rápido: só hoje (+ ontem se ainda não fechado)
+      const { syncAdAccountsSpendForStore } = await import("@/lib/ad-api-sync");
+      const { yesterdayDateKey, isApiSpendDayClosed } = await import(
+        "@/lib/ad-spend-complete"
+      );
+      const { dateKeyInTimezone, normalizeStoreTimezone } = await import(
+        "@/lib/store-timezone"
+      );
+      const { Store } = await import("@/models/Store");
+      const { ManualAdSpend } = await import("@/models/ManualAdSpend");
+      
+      const storeDoc = await Store.findById(storeId).select("ianaTimezone").lean();
+      const tz = normalizeStoreTimezone(storeDoc?.ianaTimezone);
+      const today = dateKeyInTimezone(new Date(), tz);
+      const yesterday = yesterdayDateKey(today);
+      
+      // Verificar se ontem já está fechado (sincronizado depois da meia-noite)
+      const yesterdayDoc = await ManualAdSpend.findOne({
+        storeId: store._id,
+        dateKey: yesterday,
+      })
+        .select("dateKey source amount updatedAt")
+        .lean();
+      
+      const yesterdayClosed = isApiSpendDayClosed(
+        yesterdayDoc
+          ? {
+              dateKey: yesterday,
+              source: yesterdayDoc.source as string | undefined,
+              amount: yesterdayDoc.amount,
+              updatedAt: yesterdayDoc.updatedAt,
+            }
+          : null,
+        today,
+        tz,
+      );
+      
+      // Sync hoje (sempre) + ontem (só se ainda não fechado)
+      const promises: Promise<unknown>[] = [
+        syncAdAccountsSpendForStore(storeId, {
+          dateKey: today,
+          campaignDateKeys: [today],
+        }),
+      ];
+      
+      if (!yesterdayClosed) {
+        promises.push(
+          syncAdAccountsSpendForStore(storeId, {
+            dateKey: yesterday,
+            campaignDateKeys: [yesterday],
+            forceOverwrite: Boolean(yesterdayDoc),
+            skipDailyNote: true,
+          }),
+        );
+      }
+      
+      await Promise.all(promises);
+    }
+    revalidatePath("/anuncios");
+    revalidatePath("/definicoes");
+    return { ok: true };
+  } catch (e) {
+    return {
+      error: e instanceof Error ? e.message : "Falha ao sincronizar ads.",
+    };
+  }
+}
+
+const META_OAUTH_COOKIE = legacyOAuthTokenCookie("meta");
+const GOOGLE_OAUTH_COOKIE = legacyOAuthTokenCookie("google");
+
+/** Lê token OAuth do cookie httpOnly (não devolve ao cliente). */
+async function peekOAuthToken(
+  platform: "meta" | "google",
+  storeId: string,
+): Promise<{ token: string; loginEmail?: string } | null> {
+  if (!mongoose.isValidObjectId(storeId)) return null;
+  const jar = await cookies();
+  const scopedCookie = adOAuthTokenCookie(platform, storeId);
+  let token = jar.get(scopedCookie)?.value ?? null;
+  if (!token) {
+    const legacy =
+      platform === "meta" ? META_OAUTH_COOKIE : GOOGLE_OAUTH_COOKIE;
+    token = jar.get(legacy)?.value ?? null;
+  }
+  if (!token) return null;
+  const emailCookie = adOAuthLoginEmailCookie(platform, storeId);
+  const loginEmail = jar.get(emailCookie)?.value?.trim() || undefined;
+  return { token, loginEmail };
+}
+
+async function clearOAuthToken(
+  platform: "meta" | "google",
+  storeId: string,
+): Promise<void> {
+  const jar = await cookies();
+  jar.delete(adOAuthTokenCookie(platform, storeId));
+  jar.delete(adOAuthLoginEmailCookie(platform, storeId));
+  jar.delete(
+    platform === "meta" ? META_OAUTH_COOKIE : GOOGLE_OAUTH_COOKIE,
+  );
+}
+
+/**
+ * Lista contas Meta com o token OAuth pendente (cookie httpOnly).
+ * O access token nunca é enviado ao browser.
+ */
+export async function discoverMetaFromOAuthAction(
+  storeId: string,
+): Promise<AdAccountsDiscoverState & { loginEmail?: string }> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+  if (!mongoose.isValidObjectId(storeId)) {
+    return { error: "Loja inválida." };
+  }
+  const store = await findStoreForUser(user, storeId, "_id");
+  if (!store) return { error: "Loja não encontrada ou sem acesso." };
+
+  const pending = await peekOAuthToken("meta", storeId);
+  if (!pending?.token) {
+    return { error: "Sem token OAuth Meta — autoriza outra vez." };
+  }
+
+  try {
+    const meta = await listMetaAdAccounts(pending.token);
+    return {
+      platform: "meta",
+      meta,
+      loginEmail: pending.loginEmail,
+    };
+  } catch (e) {
+    return {
+      error:
+        e instanceof MetaApiError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : "Falha ao listar contas Meta.",
+    };
+  }
+}
+
+async function consumeOAuthPending(
+  platform: "meta" | "google",
+  storeId: string,
+): Promise<AdOAuthPending | null> {
+  if (!mongoose.isValidObjectId(storeId)) return null;
+
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return null;
+  const store = await findStoreForUser(user, storeId, "_id");
+  if (!store) return null;
+
+  const pending = await peekOAuthToken(platform, storeId);
+  if (!pending?.token) return null;
+
+  if (platform === "google" && pending.loginEmail) {
+    try {
+      await upsertWorkspaceGoogleCredential(
+        user.workspaceId,
+        pending.loginEmail,
+        pending.token,
+      );
+    } catch {
+      /* cookie ainda serve nesta sessão */
+    }
+  }
+
+  // Meta: não devolver o token ao cliente — usar discoverMetaFromOAuthAction.
+  if (platform === "meta") {
+    return { token: "", loginEmail: pending.loginEmail };
+  }
+
+  await clearOAuthToken(platform, storeId);
+  return { token: pending.token, loginEmail: pending.loginEmail };
+}
+
+/** @deprecated Preferir discoverMetaFromOAuthAction (token não sai do servidor). */
+export async function consumeMetaOAuthTokenAction(
+  storeId: string,
+): Promise<AdOAuthPending | null> {
+  const pending = await peekOAuthToken("meta", storeId);
+  if (!pending) return null;
+  return { token: "", loginEmail: pending.loginEmail };
+}
+
+/** Lê refresh token Google guardado após OAuth desta loja (consumido uma vez). */
+export async function consumeGoogleOAuthTokenAction(
+  storeId: string,
+): Promise<AdOAuthPending | null> {
+  return consumeOAuthPending("google", storeId);
+}
+
+export async function updateAdAccountFeesAction(
+  _prev: AdAccountActionState,
+  formData: FormData,
+): Promise<AdAccountActionState> {
+  const user = await getCurrentUser();
+  if (!user?.workspaceId) return { error: "Sessão inválida." };
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão." };
+  }
+
+  const accountId = String(formData.get("accountId") ?? "").trim();
+  const apiExtraFeeFixed = Number(formData.get("apiExtraFeeFixed") ?? 0);
+  const apiAgencyFeePercent = Number(formData.get("apiAgencyFeePercent") ?? 0);
+
+  if (!accountId) return { error: "Conta em falta." };
+  if (apiExtraFeeFixed < 0 || apiAgencyFeePercent < 0 || apiAgencyFeePercent > 100) {
+    return { error: "Fees inválidas." };
+  }
+
+  const ok = await updateAdAccountApiFees(user.workspaceId, accountId, {
+    apiExtraFeeFixed,
+    apiAgencyFeePercent,
+  });
+  if (!ok) return { error: "Conta não encontrada." };
+
+  revalidatePath("/anuncios");
+  return { ok: true };
+}
