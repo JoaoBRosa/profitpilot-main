@@ -102,9 +102,13 @@ const StoreSchema = new Schema(
     /** Como o COGS é preenchido nesta loja. */
     cogsMode: {
       type: String,
-      enum: ["shopify", "variant", "order", "day"],
+      enum: ["shopify", "variant", "order", "day", "percent"],
       default: "shopify",
     },
+    /** Percentagem da receita usada como COGS quando cogsMode === "percent" (0-100). */
+    cogsPercent: { type: Number, default: null, min: 0, max: 100 },
+    /** Portes grátis ao cliente — ignora o valor de envio vindo da Shopify (fica sempre 0). */
+    freeShipping: { type: Boolean, default: false },
     /** Moeda usada na entrada manual de COGS (USD ou EUR). */
     cogsInputCurrency: {
       type: String,

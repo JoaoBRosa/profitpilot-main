@@ -420,6 +420,7 @@ export default async function DefinicoesPage() {
                           currency,
                           status,
                           autoSync: s.autoSync ?? true,
+                          freeShipping: s.freeShipping ?? false,
                           startingBalance: s.startingBalance ?? 0,
                           startingBalanceDate: s.startingBalanceDate
                             ? new Date(s.startingBalanceDate).toISOString().slice(0, 10)
@@ -430,6 +431,7 @@ export default async function DefinicoesPage() {
                             forceDayCogsByStore.get(String(s._id)) ?? false,
                           cogsDayFromKey: s.cogsDayFromKey ?? null,
                           cogsMode,
+                          cogsPercent: s.cogsPercent ?? null,
                           cogsInputCurrency: s.cogsInputCurrency ?? "EUR",
                           externalGatewayPayoutBusinessDays:
                             s.externalGatewayPayoutBusinessDays ?? null,

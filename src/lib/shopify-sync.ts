@@ -1517,15 +1517,23 @@ export async function syncOrdersPage(
         })
         .filter((li): li is NonNullable<typeof li> => li != null);
 
-      const cogs = lineItems.reduce(
+      const perLineCogs = lineItems.reduce(
         (sum, li) => sum + li.unitCost * li.quantity,
         0,
       );
       const totalPrice = num(o.currentTotalPriceSet?.shopMoney.amount);
       const subtotal = num(o.currentSubtotalPriceSet?.shopMoney.amount);
       const refunded = num(o.totalRefundedSet?.shopMoney.amount);
-      const shipping = num(o.totalShippingPriceSet?.shopMoney.amount);
+      const shipping = store.freeShipping
+        ? 0
+        : num(o.totalShippingPriceSet?.shopMoney.amount);
       const netRevenue = orderNetRevenue({ subtotal, totalPrice, refunded });
+      // Modo "percent": COGS = % fixa da receita líquida, em vez do custo
+      // por artigo (não depende de custos preenchidos na Shopify).
+      const cogs =
+        store.cogsMode === "percent" && store.cogsPercent != null
+          ? Math.round(netRevenue * (store.cogsPercent / 100) * 100) / 100
+          : perLineCogs;
       const feesForBase = existingFees.get(o.id) ?? 0;
 
       const manualCogs = revertCogs

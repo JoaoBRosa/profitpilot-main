@@ -28,6 +28,7 @@ export type StoreValues = {
   currency: string;
   status: "active" | "paused" | "archived";
   autoSync: boolean;
+  freeShipping: boolean;
   startingBalance: number;
   startingBalanceDate: string;
   /** Códigos ISO seleccionados; vazio = todos os países. */
@@ -36,6 +37,7 @@ export type StoreValues = {
   forceDayCogs: boolean;
   cogsDayFromKey?: string | null;
   cogsMode: CogsMode;
+  cogsPercent: number | null;
   cogsInputCurrency: string;
   externalGatewayPayoutBusinessDays: number | null;
 };
@@ -77,6 +79,9 @@ export function StoreSettingsForm({
     store.analyticsSessionCountries,
   );
   const [cogsMode, setCogsMode] = useState<CogsMode>(store.cogsMode);
+  const [cogsPercent, setCogsPercent] = useState<string>(
+    store.cogsPercent != null ? String(store.cogsPercent) : "",
+  );
   const multiCountry = selectedCountries.length > 1;
   const forceDayCogs = store.forceDayCogs && multiCountry;
   const effectiveCogsMode = forceDayCogs ? "day" : cogsMode;
@@ -259,6 +264,34 @@ export function StoreSettingsForm({
                 Fixado em «Por dia» — há vendas noutro país de sessões.
               </p>
             )}
+            {effectiveCogsMode === "percent" && (
+              <div className="mt-3">
+                <label className={labelCls}>
+                  % da receita usada como COGS
+                </label>
+                <div className="relative">
+                  <input
+                    type="number"
+                    name="cogsPercent"
+                    inputMode="decimal"
+                    min={0}
+                    max={100}
+                    step="0.1"
+                    value={cogsPercent}
+                    disabled={!canEdit}
+                    onChange={(e) => setCogsPercent(e.target.value)}
+                    className={inputCls}
+                    placeholder="ex.: 30"
+                  />
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Aplica-se a todas as encomendas desta loja (novas e já
+                  sincronizadas) assim que guardares — substitui o custo por
+                  artigo. Encomendas com COGS manual por dia/encomenda
+                  mantêm-se como estão.
+                </p>
+              </div>
+            )}
           </div>
           <div>
             <label className={labelCls}>Moeda de entrada</label>
@@ -377,6 +410,17 @@ export function StoreSettingsForm({
             className="h-4 w-4 rounded border-border"
           />
           Incluir esta loja no sync automático
+        </label>
+        <label className="flex items-center gap-2 text-sm sm:col-span-2">
+          <input
+            name="freeShipping"
+            type="checkbox"
+            defaultChecked={store.freeShipping}
+            disabled={!canEdit}
+            className="h-4 w-4 rounded border-border"
+          />
+          Ofereço portes grátis (ignorar o valor de envio da Shopify —
+          fica sempre 0 no lucro)
         </label>
       </div>
 

@@ -47,8 +47,9 @@ describe("eu-customs-fee — regras", () => {
     assert.equal(EU_CUSTOMS_FEE_PER_ORDER_EUR, 3);
   });
 
-  it("só modo shopify tem taxa automática", () => {
+  it("shopify e percent têm taxa automática; variant/order/day não", () => {
     assert.equal(appliesAutoEuCustomsFees("shopify"), true);
+    assert.equal(appliesAutoEuCustomsFees("percent"), true);
     assert.equal(appliesAutoEuCustomsFees("variant"), false);
     assert.equal(appliesAutoEuCustomsFees("order"), false);
     assert.equal(appliesAutoEuCustomsFees("day"), false);

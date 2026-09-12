@@ -110,6 +110,7 @@ const storeSchema = z.object({
   name: z.string().trim().min(1, "Dá um nome à loja."),
   status: z.enum(["active", "paused", "archived"]),
   autoSync: z.boolean(),
+  freeShipping: z.boolean(),
   startingBalance: z.number(),
   startingBalanceDate: z.string().trim(),
   analyticsSessionCountries: z.array(z.string()),
@@ -122,6 +123,14 @@ const storeSchema = z.object({
       "Usa o domínio público (.com), não o .myshopify.com.",
     ),
   cogsMode: z.enum(COGS_MODES).optional(),
+  cogsPercent: z.preprocess(
+    (v) => {
+      if (v === "" || v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    },
+    z.number().min(0).max(100).nullable(),
+  ),
   cogsInputCurrency: z.enum(COGS_INPUT_CURRENCIES).optional(),
   externalGatewayPayoutBusinessDays: z.preprocess(
     (v) => {
@@ -148,6 +157,7 @@ export async function updateStoreSettingsAction(
     name: formData.get("name"),
     status: formData.get("status"),
     autoSync: formData.get("autoSync") === "on",
+    freeShipping: formData.get("freeShipping") === "on",
     startingBalance: numOpt(formData.get("startingBalance")),
     startingBalanceDate: String(formData.get("startingBalanceDate") ?? ""),
     analyticsSessionCountries: formData
@@ -156,6 +166,7 @@ export async function updateStoreSettingsAction(
       .filter(Boolean),
     displayUrl: String(formData.get("displayUrl") ?? ""),
     cogsMode: String(formData.get("cogsMode") ?? ""),
+    cogsPercent: formData.get("cogsPercent") ?? "",
     cogsInputCurrency: String(formData.get("cogsInputCurrency") ?? ""),
     externalGatewayPayoutBusinessDays:
       formData.get("externalGatewayPayoutBusinessDays") ?? "",
@@ -235,12 +246,14 @@ export async function updateStoreSettingsAction(
         name: d.name,
         status: d.status,
         autoSync: d.status === "archived" ? false : d.autoSync,
+        freeShipping: d.freeShipping,
         startingBalance: d.startingBalance,
         startingBalanceDate,
         analyticsSessionCountry,
         analyticsSessionCountries,
         displayUrl: normalizeDisplayUrl(d.displayUrl),
         cogsMode,
+        cogsPercent: d.cogsPercent,
         ...(forceDay && cogsDayFromKey
           ? {
               cogsDayFromKey: store.cogsDayFromKey || cogsDayFromKey,
@@ -254,6 +267,55 @@ export async function updateStoreSettingsAction(
   );
   if (res.matchedCount === 0) {
     return { error: "Loja não encontrada." };
+  }
+
+  // Portes grátis: zera o envio já sincronizado imediatamente (sem esperar
+  // por uma nova sync). Se desligares depois, a próxima sync repõe o valor
+  // real da Shopify (não é guardado nada que precise de reverter).
+  if (d.freeShipping) {
+    await Order.updateMany(
+      { storeId: d.storeId },
+      {
+        $set: {
+          shipping: 0,
+          "amountsBase.shipping": 0,
+        },
+      },
+    );
+  }
+
+  // Modo "percent": aplica a percentagem imediatamente às encomendas já
+  // sincronizadas (sem isto, só as próximas encomendas a chegar refletiam
+  // o novo valor). Encomendas com COGS manual (por dia/encomenda) mantêm-se.
+  if (cogsMode === "percent" && d.cogsPercent != null) {
+    const pct = d.cogsPercent / 100;
+    await Order.updateMany(
+      {
+        storeId: d.storeId,
+        $or: [{ manualCogs: null }, { manualCogs: { $exists: false } }],
+      },
+      [
+        {
+          $set: {
+            cogs: {
+              $round: [{ $multiply: [{ $ifNull: ["$netRevenue", 0] }, pct] }, 2],
+            },
+            "amountsBase.cogs": {
+              $cond: [
+                { $ne: ["$amountsBase.netRevenue", null] },
+                {
+                  $round: [
+                    { $multiply: ["$amountsBase.netRevenue", pct] },
+                    2,
+                  ],
+                },
+                "$amountsBase.cogs",
+              ],
+            },
+          },
+        },
+      ],
+    );
   }
 
   if (countriesChanged) {

@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import {
   addFeeScheduleEntryAction,
+  deleteFeeScheduleEntryAction,
   type FeeScheduleState,
 } from "./fee-schedule-actions";
 import type { FeeScheduleEntryView } from "@/lib/fee-schedule";
@@ -11,6 +12,43 @@ import { DecimalInput } from "@/components/decimal-input";
 const inputCls =
   "w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
 const labelCls = "mb-1 block text-sm font-medium";
+
+function DeleteFeeEntryButton({
+  storeId,
+  effectiveFromKey,
+  disabled,
+}: {
+  storeId: string;
+  effectiveFromKey: string;
+  disabled: boolean;
+}) {
+  const [state, action, pending] = useActionState<FeeScheduleState, FormData>(
+    deleteFeeScheduleEntryAction,
+    {},
+  );
+  return (
+    <form
+      action={action}
+      onSubmit={(e) => {
+        if (!confirm("Remover esta taxa do histórico?")) e.preventDefault();
+      }}
+    >
+      <input type="hidden" name="storeId" value={storeId} />
+      <input type="hidden" name="effectiveFromKey" value={effectiveFromKey} />
+      <button
+        type="submit"
+        disabled={pending || disabled}
+        title={disabled ? "Não é possível remover a única taxa." : "Remover"}
+        className="text-xs font-medium text-negative hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
+      >
+        {pending ? "…" : "Remover"}
+      </button>
+      {state.error && (
+        <p className="mt-1 text-xs text-negative">{state.error}</p>
+      )}
+    </form>
+  );
+}
 
 export function FeeSchedulePanel({
   storeId,
@@ -83,7 +121,16 @@ export function FeeSchedulePanel({
                     </span>
                   ) : null}
                 </span>
-                <span className="font-medium tabular-nums">{e.label}</span>
+                <div className="flex items-center gap-3">
+                  <span className="font-medium tabular-nums">{e.label}</span>
+                  {canEdit && (
+                    <DeleteFeeEntryButton
+                      storeId={storeId}
+                      effectiveFromKey={e.effectiveFromKey}
+                      disabled={entries.length <= 1}
+                    />
+                  )}
+                </div>
               </li>
             ))}
           </ul>

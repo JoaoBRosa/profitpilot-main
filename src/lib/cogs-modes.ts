@@ -1,5 +1,5 @@
 /** Modos de COGS configurados no setup da loja. */
-export const COGS_MODES = ["shopify", "variant", "order", "day"] as const;
+export const COGS_MODES = ["shopify", "variant", "order", "day", "percent"] as const;
 export type CogsMode = (typeof COGS_MODES)[number];
 
 /** Moedas aceites na entrada manual de COGS. */
@@ -24,7 +24,7 @@ export function defaultCogsInputCurrency(): CogsInputCurrency {
 
 /** Top produtos por unidades vendidas (em vez de lucro). */
 export function ranksProductsByUnits(mode: CogsMode | null | undefined): boolean {
-  return mode === "order" || mode === "day";
+  return mode === "order" || mode === "day" || mode === "percent";
 }
 
 /** Só o modo `shopify` importa custos de variante da Shopify no sync. */
@@ -34,11 +34,15 @@ export function syncsShopifyProductCosts(
   return (mode ?? defaultCogsMode()) === "shopify";
 }
 
-/** Taxa alfandegária UE automática (Win-Win) — só com COGS automático Shopify. */
+/**
+ * Taxa alfandegária UE automática (Win-Win) — modo Shopify automático, e
+ * também modo percentagem (a % de COGS aí não inclui esta taxa; soma-se
+ * à parte, nº de encomendas UE × €3).
+ */
 export function appliesAutoEuCustomsFees(
   mode: CogsMode | null | undefined,
 ): boolean {
-  return syncsShopifyProductCosts(mode);
+  return syncsShopifyProductCosts(mode) || mode === "percent";
 }
 
 /**
@@ -91,4 +95,5 @@ export const COGS_MODE_LABELS: Record<CogsMode, string> = {
   variant: "Por variante (manual)",
   order: "Por encomenda",
   day: "Por dia",
+  percent: "Percentagem da receita",
 };

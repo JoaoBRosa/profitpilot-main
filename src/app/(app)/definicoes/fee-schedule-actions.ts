@@ -115,3 +115,76 @@ export async function addFeeScheduleEntryAction(
   revalidatePath("/metricas");
   return { ok: true };
 }
+
+const deleteEntrySchema = z.object({
+  storeId: z.string().trim().min(1),
+  effectiveFromKey: z.string().trim().min(1),
+});
+
+export async function deleteFeeScheduleEntryAction(
+  _prev: FeeScheduleState,
+  formData: FormData,
+): Promise<FeeScheduleState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  if (!ROLES_EDIT.includes(user.role)) {
+    return { error: "Sem permissão para alterar taxas." };
+  }
+
+  const parsed = deleteEntrySchema.safeParse({
+    storeId: formData.get("storeId"),
+    effectiveFromKey: String(formData.get("effectiveFromKey") ?? ""),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Dados inválidos." };
+  }
+  const d = parsed.data;
+
+  await connectToDatabase();
+  const store = await findStoreForUser(
+    user,
+    d.storeId,
+    "feeConfig feeSchedule importStartDate createdAt ianaTimezone currency",
+  );
+  if (!store) return { error: "Loja não encontrada ou sem acesso." };
+
+  const tz = normalizeStoreTimezone(store.ianaTimezone);
+  const floorKey =
+    importDateKey(store.importStartDate, store.createdAt, tz) ??
+    dateKeyInTimezone(new Date(store.createdAt ?? Date.now()), tz);
+
+  const schedule = ensureFeeSchedule(
+    store.feeSchedule as FeeScheduleEntry[] | undefined,
+    store.feeConfig,
+    floorKey,
+  );
+
+  if (schedule.length <= 1) {
+    return { error: "Não é possível remover a única taxa registada." };
+  }
+
+  const next = schedule.filter(
+    (e) => e.effectiveFromKey !== d.effectiveFromKey,
+  );
+  if (next.length === schedule.length) {
+    return { error: "Taxa não encontrada." };
+  }
+
+  const latest = next[next.length - 1]!;
+
+  await Store.updateOne(
+    { _id: store._id },
+    {
+      $set: {
+        feeSchedule: next,
+        feeConfig: normalizeFeeConfig(latest),
+      },
+    },
+  );
+
+  revalidatePath("/definicoes");
+  revalidatePath("/dashboard");
+  revalidatePath("/financas");
+  revalidatePath("/metricas");
+  return { ok: true };
+}

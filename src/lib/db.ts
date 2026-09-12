@@ -32,6 +32,14 @@ export async function connectToDatabase() {
     });
   }
 
-  cached.conn = await cached.promise;
+  try {
+    cached.conn = await cached.promise;
+  } catch (err) {
+    // Sem isto, uma falha de ligação (ex: IP ainda não estava na whitelist)
+    // fica "presa" para sempre nesta instância do servidor — todos os pedidos
+    // seguintes repetem o mesmo erro antigo em vez de tentar ligar de novo.
+    cached.promise = null;
+    throw err;
+  }
   return cached.conn;
 }
